@@ -190,6 +190,26 @@ class SSHClient:
         log_cb(f"Stack '{stack.name}' update failed (exit {up_code}).")
         return False
 
+    def check_updates(self, os_id: str) -> int:
+        """Return count of pending package updates, or -1 on error."""
+        if os_id in ("ubuntu", "debian", "raspbian", "linuxmint", "pop"):
+            cmd = "apt list --upgradable 2>/dev/null | grep -c '\\[upgradable'"
+        elif os_id in ("fedora", "centos", "rhel", "rocky", "almalinux"):
+            cmd = "dnf list updates -q 2>/dev/null | tail -n +2 | wc -l"
+        elif os_id in ("arch", "manjaro", "endeavouros"):
+            cmd = "pacman -Qu 2>/dev/null | wc -l"
+        elif os_id == "alpine":
+            cmd = "apk list --upgrades 2>/dev/null | grep -c 'upgradable'"
+        elif os_id in ("opensuse", "suse", "opensuse-leap", "opensuse-tumbleweed"):
+            cmd = "zypper --non-interactive list-updates 2>/dev/null | grep -c '^v '"
+        else:
+            cmd = "apt list --upgradable 2>/dev/null | grep -c '\\[upgradable'"
+        out, _, _ = self.run(cmd, timeout=30)
+        try:
+            return int(out.strip())
+        except ValueError:
+            return -1
+
     def run_system_update(self, os_id: str, log_cb: Callable[[str], None]) -> bool:
         log_cb("\n--- Running system update ---")
         if os_id in ("ubuntu", "debian", "raspbian", "linuxmint", "pop"):

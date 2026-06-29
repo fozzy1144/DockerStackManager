@@ -21,7 +21,7 @@ A desktop GUI for managing and updating Linux hosts and Docker Compose stacks ov
 
 > Connect, scan, and update — all from one window.
 
-![App screenshot](docs/screenshot.png)
+![App screenshot](docs/Screenshot.png)
 
 ## Requirements
 

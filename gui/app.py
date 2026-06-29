@@ -76,8 +76,23 @@ class App(ctk.CTk):
         self._host_list_frame.grid_columnconfigure(0, weight=1)
 
         btn_row = ctk.CTkFrame(sidebar, fg_color="transparent")
-        btn_row.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
+        btn_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 0))
         ctk.CTkButton(btn_row, text="+ Add Host", command=self._add_host).pack(fill="x")
+
+        bulk_row = ctk.CTkFrame(sidebar, fg_color="transparent")
+        bulk_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 8))
+        self._btn_check_all = ctk.CTkButton(
+            bulk_row, text="Check All Updates",
+            fg_color="#2B5278", hover_color="#1E3D5C",
+            command=self._check_all_updates,
+        )
+        self._btn_check_all.pack(fill="x", pady=(0, 4))
+        self._btn_update_all = ctk.CTkButton(
+            bulk_row, text="Update All Hosts",
+            fg_color="#7B5EA7", hover_color="#6A4D96",
+            command=self._update_all_hosts,
+        )
+        self._btn_update_all.pack(fill="x")
 
         # Right content
         content = ctk.CTkFrame(self, fg_color="transparent")
@@ -252,6 +267,20 @@ class App(ctk.CTk):
                 ctk.CTkLabel(inner, text=host.os_pretty, font=ctk.CTkFont(size=11), text_color="gray60", anchor="w").grid(
                     row=2, column=0, sticky="w"
                 )
+
+            if host.pending_updates > 0:
+                ctk.CTkLabel(
+                    inner,
+                    text=f"⬆ {host.pending_updates} update{'s' if host.pending_updates != 1 else ''} available",
+                    font=ctk.CTkFont(size=11),
+                    text_color="#FFA040",
+                    anchor="w",
+                ).grid(row=3, column=0, sticky="w")
+            elif host.pending_updates == 0:
+                ctk.CTkLabel(
+                    inner, text="✓ Up to date",
+                    font=ctk.CTkFont(size=11), text_color="#4CAF50", anchor="w",
+                ).grid(row=3, column=0, sticky="w")
 
             btn_frame = ctk.CTkFrame(card, fg_color="transparent")
             btn_frame.grid(row=0, column=1, padx=4, pady=4)
@@ -510,6 +539,100 @@ class App(ctk.CTk):
             self.after(0, lambda: self._set_busy(False))
 
         threading.Thread(target=task, daemon=True).start()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Bulk operations (all hosts)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _check_all_updates(self):
+        if not self._hosts:
+            return
+        self._btn_check_all.configure(state="disabled", text="Checking…")
+        self._btn_update_all.configure(state="disabled")
+        self._log.log(f"Checking for updates on {len(self._hosts)} host(s)…")
+        remaining = [len(self._hosts)]
+
+        def check_host(host: Host):
+            password = get_password(host.hostname, host.username) or ""
+            ssh = SSHClient(host.hostname, host.username, password, host.port, key_path=host.key_path)
+            ok, err = ssh.connect()
+            if ok:
+                if not host.os_info:
+                    os_id, pretty = ssh.detect_os()
+                    self.after(0, lambda h=host, oid=os_id, p=pretty: self._on_os_detected(h, oid, p))
+                count = ssh.check_updates(host.os_info or "unknown")
+                ssh.disconnect()
+            else:
+                count = -1
+
+            def update_ui():
+                host.pending_updates = count
+                remaining[0] -= 1
+                self._refresh_host_list()
+                if count < 0:
+                    self._log.log(f"{host.display_name}: could not connect — {err}", "warn")
+                elif count == 0:
+                    self._log.log(f"{host.display_name}: up to date", "info")
+                else:
+                    self._log.log(f"{host.display_name}: {count} update(s) available", "warn")
+                if remaining[0] == 0:
+                    self._btn_check_all.configure(state="normal", text="Check All Updates")
+                    self._btn_update_all.configure(state="normal")
+                    self._log.log("Update check complete.", "success")
+
+            self.after(0, update_ui)
+
+        for host in self._hosts:
+            threading.Thread(target=check_host, args=(host,), daemon=True).start()
+
+    def _update_all_hosts(self):
+        if not self._hosts:
+            return
+        count = len(self._hosts)
+        if not messagebox.askyesno(
+            "Update All Hosts",
+            f"Run a full system update on all {count} host(s)?\nThis may take several minutes per host.",
+            parent=self,
+        ):
+            return
+
+        self._btn_update_all.configure(state="disabled", text="Updating All…")
+        self._btn_check_all.configure(state="disabled")
+        self._log.log(f"Starting system update on {count} host(s)…")
+        remaining = [count]
+
+        def update_host(host: Host):
+            password = get_password(host.hostname, host.username) or ""
+            ssh = SSHClient(host.hostname, host.username, password, host.port, key_path=host.key_path)
+
+            def log(msg: str):
+                self.after(0, lambda m=msg: self._log.log(f"[{host.display_name}] {m}"))
+
+            ok, err = ssh.connect()
+            if not ok:
+                log(f"Connection failed: {err}")
+                success = False
+            else:
+                if not host.os_info:
+                    os_id, pretty = ssh.detect_os()
+                    self.after(0, lambda h=host, oid=os_id, p=pretty: self._on_os_detected(h, oid, p))
+                success = ssh.run_system_update(host.os_info or "unknown", log_cb=log)
+                if success:
+                    host.pending_updates = 0
+                ssh.disconnect()
+
+            def done_ui():
+                remaining[0] -= 1
+                self._refresh_host_list()
+                if remaining[0] == 0:
+                    self._btn_update_all.configure(state="normal", text="Update All Hosts")
+                    self._btn_check_all.configure(state="normal")
+                    self._log.log("All host updates finished.", "success")
+
+            self.after(0, done_ui)
+
+        for host in self._hosts:
+            threading.Thread(target=update_host, args=(host,), daemon=True).start()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Helpers

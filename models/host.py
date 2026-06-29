@@ -31,6 +31,8 @@ class Host:
     os_info: str = ""
     os_pretty: str = ""
     stacks: list[DockerStack] = field(default_factory=list)
+    # Runtime-only — not persisted to disk
+    pending_updates: int = -1
 
     @property
     def display_name(self) -> str:

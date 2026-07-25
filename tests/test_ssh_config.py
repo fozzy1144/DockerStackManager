@@ -161,6 +161,7 @@ class TestIdentityFiles(unittest.TestCase):
         self.assertTrue(hosts[0].identity_file.endswith("id_rsa"))
 
     def test_windows_path_survives(self):
+        # Backslashes must not be mangled; VS Code writes native paths here.
         hosts = parse_text(
             "Host a\n  User u\n  IdentityFile C:\\Users\\example\\.ssh\\id_ed25519\n"
         )

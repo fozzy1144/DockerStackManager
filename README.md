@@ -29,9 +29,15 @@ A desktop GUI for managing and updating Linux hosts and Docker Compose stacks ov
 
 ## Screenshots
 
-> Connect, scan, and update — all from one window.
+Hosts, stacks and live output in one window. Each stack has **Manage** and **Edit**; the sidebar shows pending OS updates per host, including a host that could not be reached.
 
-![App screenshot](docs/Screenshot.png)
+![Main window](docs/Screenshot.png)
+
+The compose editor: YAML highlighting, the documented example library on the left, and the checks panel calling out an unpinned tag and a missing restart policy.
+
+![Compose editor](docs/Screenshot-editor.png)
+
+> Hosts, addresses and stacks shown above are fictional; the addresses come from the IANA documentation ranges reserved for exactly this purpose.
 
 ## Requirements
 

@@ -1,6 +1,7 @@
 """Data models for managed hosts and the Docker Compose stacks found on them."""
 
 from dataclasses import dataclass, field, fields
+from typing import Optional
 
 # Sentinel values for Host.pending_updates. Real counts are >= 0.
 UPDATES_UNKNOWN = -1
@@ -8,6 +9,26 @@ UPDATES_UNKNOWN = -1
 
 UPDATES_FAILED = -2
 """The last update check could not complete (unreachable, or unparsable output)."""
+
+
+@dataclass(frozen=True, slots=True)
+class ImageStatus:
+    """Whether one of a stack's images has a newer version in its registry."""
+
+    image: str
+    local_digest: str = ""
+    remote_digest: str = ""
+    update_available: Optional[bool] = None
+    """``None`` when it could not be determined — never guessed."""
+
+    detail: str = ""
+    """Why it is unknown, or how the comparison was made."""
+
+    @property
+    def label(self) -> str:
+        if self.update_available is None:
+            return "unknown"
+        return "update available" if self.update_available else "up to date"
 
 
 @dataclass(slots=True)
@@ -29,12 +50,36 @@ class DockerStack:
     project: str = ""
     """Compose project name as Docker reports it, when discovered from Docker."""
 
+    image_snapshot: dict[str, str] = field(default_factory=dict)
+    """Image reference to image ID, recorded before the last pull.
+
+    This is what makes a rollback possible: after a pull replaces ``app:latest``
+    the previous image is still on disk but untagged, and only its ID identifies
+    it. Persisted, because a rollback is usually wanted in a later session than
+    the update that caused it.
+    """
+
+    snapshot_taken: str = ""
+    """When :attr:`image_snapshot` was recorded, for display. Empty if never."""
+
     def to_dict(self) -> dict:
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
     @classmethod
     def from_dict(cls, data: dict) -> "DockerStack":
-        return _build(cls, data)
+        stack = _build(cls, data)
+        # Tolerate a corrupted or foreign snapshot rather than failing the load.
+        if not isinstance(stack.image_snapshot, dict):
+            stack.image_snapshot = {}
+        else:
+            stack.image_snapshot = {
+                str(k): str(v) for k, v in stack.image_snapshot.items()
+            }
+        return stack
+
+    @property
+    def can_roll_back(self) -> bool:
+        return bool(self.image_snapshot)
 
 
 @dataclass(frozen=True, slots=True)

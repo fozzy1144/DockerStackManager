@@ -83,6 +83,72 @@ class TestHostPersistence(unittest.TestCase):
             self.assertTrue(nested.is_dir())
 
 
+class TestAsyncSaving(unittest.TestCase):
+    """Deferred writes: the UI thread must never wait on the disk."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        directory = Path(self._temp.name)
+        self._patches = [
+            mock.patch.object(credentials, "CONFIG_DIR", directory),
+            mock.patch.object(credentials, "HOSTS_FILE", directory / "hosts.json"),
+        ]
+        for patch in self._patches:
+            patch.start()
+        self.path = directory / "hosts.json"
+
+    def tearDown(self):
+        credentials.flush_pending_saves(5.0)
+        for patch in self._patches:
+            patch.stop()
+        self._temp.cleanup()
+
+    def test_async_save_lands_on_disk(self):
+        credentials.save_hosts_async([Host("10.0.0.1", "root")])
+        credentials.flush_pending_saves(5.0)
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(data[0]["hostname"], "10.0.0.1")
+
+    def test_a_burst_coalesces_to_the_final_state(self):
+        for index in range(40):
+            credentials.save_hosts_async([Host(f"host{index}", "u")])
+        credentials.flush_pending_saves(10.0)
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(data[0]["hostname"], "host39")
+
+    def test_no_temp_file_is_left_behind(self):
+        for index in range(10):
+            credentials.save_hosts_async([Host(f"h{index}", "u")])
+        credentials.flush_pending_saves(10.0)
+        self.assertEqual(list(Path(self._temp.name).glob("*.tmp")), [])
+
+    def test_serialization_happens_on_the_calling_thread(self):
+        """The snapshot must be taken before returning, so later edits are safe."""
+        host = Host("original", "u")
+        credentials.save_hosts_async([host])
+        host.hostname = "mutated-immediately-after"
+        credentials.flush_pending_saves(5.0)
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(data[0]["hostname"], "original")
+
+    def test_write_errors_reach_the_callback(self):
+        errors: list[Exception] = []
+        with mock.patch.object(
+            credentials, "_write_payload", side_effect=OSError("disk full")
+        ):
+            credentials.save_hosts_async([Host("h", "u")], on_error=errors.append)
+            credentials.flush_pending_saves(5.0)
+        self.assertTrue(errors)
+        self.assertIsInstance(errors[0], OSError)
+
+    def test_flush_with_nothing_pending_returns(self):
+        credentials.flush_pending_saves(1.0)
+
+    def test_serialize_hosts_is_valid_json(self):
+        payload = credentials.serialize_hosts([Host("h", "u")])
+        self.assertEqual(json.loads(payload)[0]["username"], "u")
+
+
 class TestKeyringErrorHandling(unittest.TestCase):
     """A missing or broken keyring backend must not take the app down."""
 

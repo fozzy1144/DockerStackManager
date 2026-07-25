@@ -27,7 +27,7 @@ from gui.theme import (
     SELECTED,
     state_color,
 )
-from models.host import Container, DockerStack
+from models.host import Container, DockerStack, ImageStatus
 
 TAIL_CHOICES = ("100", "500", "2000", "all")
 
@@ -143,10 +143,23 @@ class StackWindow(ctk.CTkToplevel):
             button.pack(side="left", padx=3)
             self._buttons.append(button)
 
+        self._btn_images = ctk.CTkButton(
+            row, text="Check images", width=112, height=28, command=self._check_images
+        )
+        self._btn_images.pack(side="left", padx=(14, 3))
+        self._buttons.append(self._btn_images)
+
+        self._btn_rollback = ctk.CTkButton(
+            row, text="Roll back", width=88, height=28,
+            fg_color=DANGER, hover_color=DANGER_HOVER, command=self._roll_back,
+        )
+        self._btn_rollback.pack(side="left", padx=3)
+        self._buttons.append(self._btn_rollback)
+
         self._btn_edit = ctk.CTkButton(
             row, text="Edit compose", width=112, height=28, command=self._edit
         )
-        self._btn_edit.pack(side="left", padx=(14, 3))
+        self._btn_edit.pack(side="left", padx=3)
         self._buttons.append(self._btn_edit)
 
         self._btn_refresh = ctk.CTkButton(
@@ -329,6 +342,94 @@ class StackWindow(ctk.CTkToplevel):
     def _edit(self) -> None:
         if self._on_edit is not None:
             self._on_edit(self._stack)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Image freshness and rollback
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _check_images(self) -> None:
+        """Ask each image's registry whether a newer version exists."""
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._log.log(f"Checking image versions for {self._stack.name}…")
+
+        def task() -> None:
+            statuses = self._ssh.check_stack_images(self._stack)
+            self.after(0, lambda: self._show_image_statuses(statuses))
+
+        _in_thread(task)
+
+    def _show_image_statuses(self, statuses: list[ImageStatus]) -> None:
+        self._set_busy(False)
+        if not statuses:
+            self._log.log(
+                "No images found — is this a valid compose file, and is Docker "
+                "reachable?",
+                "warn",
+            )
+            return
+
+        outdated = 0
+        for status in statuses:
+            if status.update_available:
+                outdated += 1
+                level = "warn"
+            elif status.update_available is None:
+                level = "info"
+            else:
+                level = "success"
+            suffix = f" ({status.detail})" if status.detail else ""
+            self._log.log(f"{status.image}: {status.label}{suffix}", level)
+
+        unknown = sum(1 for s in statuses if s.update_available is None)
+        summary = f"{outdated} of {len(statuses)} image(s) have updates"
+        if unknown:
+            summary += f", {unknown} could not be determined"
+        self._log.log(summary, "warn" if outdated else "success")
+
+    def _roll_back(self) -> None:
+        """Restore the image versions recorded before the last pull."""
+        if self._busy:
+            return
+        snapshot = dict(self._stack.image_snapshot)
+        if not snapshot:
+            messagebox.showinfo(
+                "Nothing to roll back to",
+                "No previous image versions have been recorded for this stack.\n\n"
+                "A rollback point is created automatically the next time the stack "
+                "is updated from this application.",
+                parent=self,
+            )
+            return
+
+        taken = self._stack.snapshot_taken or "an earlier update"
+        listing = "\n".join(f"  • {image}" for image in sorted(snapshot))
+        if not messagebox.askyesno(
+            "Roll back images",
+            f"Restore the image versions recorded at {taken}?\n\n{listing}\n\n"
+            f"Containers will be recreated from those images.",
+            parent=self,
+        ):
+            return
+
+        self._set_busy(True)
+
+        def task() -> None:
+            ok = self._ssh.rollback_stack(self._stack, snapshot, self._log.log)
+            self.after(0, lambda: self._after_rollback(ok))
+
+        _in_thread(task)
+
+    def _after_rollback(self, ok: bool) -> None:
+        self._set_busy(False)
+        self._log.log(
+            "Rollback complete." if ok else "Rollback did not complete.",
+            "success" if ok else "error",
+        )
+        if ok and self._on_changed is not None:
+            self._on_changed()
+        self.refresh()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Log streaming

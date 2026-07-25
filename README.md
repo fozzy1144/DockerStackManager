@@ -9,6 +9,7 @@ A desktop GUI for managing and updating Linux hosts and Docker Compose stacks ov
 ## Features
 
 - **Multi-host management** — add as many Linux hosts as you need; switch between them with one click
+- **Import from your SSH config** — pulls in the same hosts VS Code Remote-SSH uses, including key paths, so a machine you already reach from the editor is one click from being managed here
 - **Secure credentials** — passwords stored in the OS credential manager (Windows Credential Manager); never written to disk in plaintext
 - **SSH key support** — connect with a private key file instead of (or alongside) a password
 - **Host key verification** — a host's key is remembered the first time you connect, and a later *change* is reported instead of silently accepted
@@ -21,6 +22,8 @@ A desktop GUI for managing and updating Linux hosts and Docker Compose stacks ov
 - **Live log output** — stack pulls and package upgrades stream line by line as they happen, and can be saved to a file
 - **Compose editor** — edit a stack's compose file in place with YAML highlighting, live checks, an example library, a diff before saving, host-side validation, and an automatic timestamped backup
 - **Per-stack control** — container list with health and published ports, lifecycle buttons (up, restart, stop, pull, recreate, down), and log following per service
+- **Image update checks** — asks each image's registry whether a newer version exists, without downloading layers, and says "unknown" rather than guessing when it cannot tell
+- **Rollback** — every update records the image versions it replaced, so a bad pull can be undone
 - **Disk housekeeping** — `docker system df` at a glance, with selective pruning of images, containers, build cache, and volumes
 - **Fast failure when a host is down** — an unreachable host is reported in seconds with the reason, and the window stays usable while a connection is pending
 
@@ -59,6 +62,24 @@ python main.py
 
 ## Usage
 
+### Importing the hosts you already have
+
+Click **Import…** next to *+ Add Host*. This reads your OpenSSH config — which is exactly where **VS Code Remote-SSH** gets its host list from, so anything you connect to in the editor shows up here.
+
+Read from `~/.ssh/config`, or from `remote.SSH.configFile` if you have set it in VS Code. `Include` directives are followed, and OpenSSH's rules are honoured: a `Host` line may carry several patterns, and the *first* value obtained for a keyword wins (which is why `Host *` defaults belong at the bottom of the file). `Match` blocks are skipped, because their conditions depend on the connection being attempted.
+
+Each row says what importing it would do:
+
+| | Meaning |
+| --- | --- |
+| **add** | Not configured here yet — a new host, labelled with its SSH alias. |
+| **attach key** | Already configured, but without the `IdentityFile` your SSH config names. |
+| **no change** | Already configured, or no `User` in the config to import. |
+
+Nothing is written until you press Import, and passwords are never read from the SSH config — key files are referenced by path, not copied.
+
+Attaching a key does not disable password authentication: both are offered, so a host that only accepts a password keeps working. If a host needs a password for `sudo` as well as a key to log in, set the password in **Edit** — see [Privileges](#privileges).
+
 1. Click **+ Add Host** and enter the hostname/IP, port, username, and either a password or an SSH key file.
 2. Select the host from the sidebar and click **Connect**.
 3. Click **Scan Stacks** to discover all Docker Compose projects on the host.
@@ -83,6 +104,14 @@ Each discovered stack has two buttons.
 | Down | `down` | Removes containers and the network. **Named volumes are kept.** |
 
 Logs stream with a tail length, an optional service filter, and follow on or off. **Stop** terminates the remote `logs -f` rather than abandoning it.
+
+**Check images** asks each image's registry whether a newer version exists. Only manifests are fetched — no layers are downloaded — by comparing the digest the registry serves for a tag against the digest the local copy is stored under. `docker buildx imagetools` is preferred because it reports the *index* digest, which is what a multi-architecture image is recorded under locally; `docker manifest inspect` is the fallback.
+
+When it cannot tell, it says **unknown** and why. That is deliberate: a false "up to date" hides a security update, and a false "update available" trains you to ignore the indicator. The honest unknown cases are a registry it cannot reach, an image not present locally, and a multi-arch image on a host without buildx.
+
+**Roll back** restores the image versions recorded before the last update. Every update through this application snapshots each image's ID first — IDs, not tags, because a pull moves the tag and leaves the previous image on disk untagged, identifiable only by ID. Rollback re-tags those IDs and forces a recreate.
+
+It refuses, without changing anything, if any recorded image has since been removed from the host: a partial rollback would leave the stack matching neither version. `docker image prune` deletes untagged images, so pruning discards your rollback points — worth knowing before using **Cleanup**.
 
 **Edit** opens the compose editor — see below.
 
@@ -118,6 +147,7 @@ A failed pull deliberately aborts before `up`, because recreating containers aga
 | What | Where |
 | --- | --- |
 | Passwords and key passphrases | OS credential manager, under the service `DockerStackManager` |
+| SSH host aliases and key paths | Read from `~/.ssh/config` on import; never written to |
 | Hosts, ports, key paths, discovered stacks | `~/.docker_stack_manager/hosts.json` |
 | Accepted SSH host keys | `~/.docker_stack_manager/known_hosts` |
 
@@ -161,6 +191,9 @@ Docker commands follow the same idea: if your user cannot reach the Docker socke
 | Update count looks stale | Counts come from the package lists already on the host; refreshing them needs root. Run a system update to resynchronise. |
 | Editor cannot save | The compose file needs root and passwordless `sudo` is not configured — see [Privileges](#privileges). The backup and the write happen together, so a failure changes nothing. |
 | Log viewer shows nothing | The stack's logging driver is not `json-file` or `local`; `docker compose logs` cannot read `syslog` or `journald`. |
+| Image check says *unknown* | The registry was unreachable, the image is not pulled yet, or it is multi-arch and the host has no `docker buildx`. It never guesses. |
+| Rollback refuses | A recorded image is gone from the host — usually because `docker image prune` removed it, since a superseded image is untagged. |
+| Import found nothing | VS Code Remote-SSH reads `~/.ssh/config`; if your hosts live elsewhere, point `remote.SSH.configFile` at that file. |
 
 ## Architecture
 
@@ -173,19 +206,21 @@ DockerStackManager/
 │   └── host.py              # Host, DockerStack, Container
 ├── core/
 │   ├── distro.py            # Per-distro package-manager commands and badge colours
-│   ├── credentials.py       # Keyring secrets + atomic config persistence
+│   ├── credentials.py       # Keyring secrets + atomic/deferred config persistence
 │   ├── compose.py           # Compose parsing, linting, diffing (no network)
 │   ├── snippets.py          # Documented example configurations
+│   ├── ssh_config.py        # OpenSSH config parser + import planning
 │   └── ssh_client.py        # SSH transport: connect, probe, run, stream, transfer
 ├── gui/
 │   ├── app.py               # Main window and action coordination
 │   ├── theme.py             # Shared severity and state colours
 │   ├── host_list.py         # Sidebar host cards
 │   ├── host_dialog.py       # Add/Edit host dialog
+│   ├── import_dialog.py     # Pick hosts to import from the SSH config
 │   ├── log_panel.py         # Batched, thread-safe output log
 │   ├── code_editor.py       # YAML editor widget: gutter, highlighting, find
 │   ├── compose_editor.py    # Editor window: examples, checks, diff, save
-│   ├── stack_window.py      # Containers, lifecycle actions, log following
+│   ├── stack_window.py      # Containers, actions, images, rollback, logs
 │   └── maintenance.py       # Disk usage and pruning
 ├── tools/
 │   └── gen_compose_docs.py  # Regenerates docs/compose-reference.md
@@ -205,6 +240,8 @@ Four conventions hold the layers apart and are worth preserving:
 **`core/` never imports from `gui/`.** Everything in `core/` is testable without a display, which is why the compose linter, the snippet library, the output pump, and the reachability probe all have real tests.
 
 **Nothing blocks the UI thread.** Every network call runs on a worker thread and returns via `after()`. The one exception is logging: `LogPanel.log` is safe to call from any thread because it only enqueues, and a single timer drains the queue with one batched widget insert per tick — which is what keeps the window responsive while `apt` streams thousands of lines.
+
+**Config writes never block the window.** `save_hosts_async` serialises on the calling thread — so the snapshot cannot tear — and defers only the disk write, coalescing bursts into one. A bulk check finishing on nine hosts at once costs a single write. The shutdown path saves synchronously and flushes, because a deferred write must not die with the process.
 
 **A pending connection must not lock the window.** Connecting deliberately does *not* set the busy flag, and the attempt is tracked by a token so switching hosts mid-connect abandons it. An apparently frozen window while a dead host timed out was a real bug; the reachability probe and this token are the two halves of the fix.
 

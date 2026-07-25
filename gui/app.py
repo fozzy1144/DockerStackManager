@@ -17,18 +17,22 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox
 
-from core import distro
+from core import distro, ssh_config
 from core.credentials import (
     delete_password,
+    flush_pending_saves,
     get_password,
     load_hosts,
     save_hosts,
+    save_hosts_async,
     save_password,
 )
 from core.ssh_client import SSHClient
 from gui.compose_editor import ComposeEditor
 from gui.host_dialog import HostDialog
 from gui.host_list import HostList, os_badge_color
+from gui.import_dialog import ImportHostsDialog
+from gui.import_dialog import summarize as import_summary
 from gui.log_panel import LogPanel
 from gui.maintenance import MaintenanceWindow
 from gui.stack_window import StackWindow
@@ -138,9 +142,20 @@ class App(ctk.CTk):
         )
         self._host_list.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
 
-        ctk.CTkButton(sidebar, text="+ Add Host", command=self._add_host).grid(
-            row=2, column=0, sticky="ew", padx=8, pady=(4, 0)
+        add_row = ctk.CTkFrame(sidebar, fg_color="transparent")
+        add_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 0))
+        add_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(add_row, text="+ Add Host", command=self._add_host).grid(
+            row=0, column=0, sticky="ew"
         )
+        ctk.CTkButton(
+            add_row,
+            text="Import…",
+            width=76,
+            fg_color=ACCENT_TEAL,
+            hover_color=ACCENT_TEAL_HOVER,
+            command=self._import_from_ssh_config,
+        ).grid(row=0, column=1, padx=(4, 0))
 
         bulk = ctk.CTkFrame(sidebar, fg_color="transparent")
         bulk.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 8))
@@ -273,7 +288,7 @@ class App(ctk.CTk):
         if result["password"]:
             save_password(host.hostname, host.username, result["password"])
         self._hosts.append(host)
-        save_hosts(self._hosts)
+        self._save_hosts_soon()
         self._host_list.set_hosts(self._hosts)
         self._select_host(host)
 
@@ -312,7 +327,7 @@ class App(ctk.CTk):
             host.stacks = []
             host.pending_updates = UPDATES_UNKNOWN
 
-        save_hosts(self._hosts)
+        self._save_hosts_soon()
         self._host_list.set_hosts(self._hosts)
         self._host_list.set_active(self._active)
         if host is self._active:
@@ -338,7 +353,7 @@ class App(ctk.CTk):
         ):
             delete_password(host.hostname, host.username)
 
-        save_hosts(self._hosts)
+        self._save_hosts_soon()
         self._host_list.set_hosts(self._hosts)
         self._host_list.set_active(self._active)
 
@@ -346,6 +361,68 @@ class App(ctk.CTk):
         dialog = HostDialog(self, host=host)
         self.wait_window(dialog)
         return dialog.result
+
+    def _import_from_ssh_config(self) -> None:
+        """Bring in hosts from ``~/.ssh/config`` — VS Code Remote-SSH's own list.
+
+        Reading the SSH config rather than any editor-specific store is what makes
+        the two lists agree: Remote-SSH has no host list of its own.
+        """
+        paths = ssh_config.candidate_paths()
+        config_hosts = ssh_config.load_hosts(paths)
+        if not config_hosts:
+            messagebox.showinfo(
+                "Nothing to import",
+                "No hosts found in:\n\n"
+                + "\n".join(str(path) for path in paths)
+                + "\n\nVS Code Remote-SSH reads ~/.ssh/config unless "
+                  "remote.SSH.configFile points elsewhere.",
+                parent=self,
+            )
+            return
+
+        candidates = ssh_config.plan_import(config_hosts, self._hosts)
+        dialog = ImportHostsDialog(self, candidates, paths)
+        self.wait_window(dialog)
+        if not dialog.result:
+            return
+
+        added, keyed = self._apply_import(dialog.result)
+        self._save_hosts_soon()
+        self._host_list.set_hosts(self._hosts)
+        self._host_list.set_active(self._active)
+        self._log.log(f"Import: {import_summary(dialog.result)}.", "success")
+        if added:
+            self._log.log(
+                f"{added} imported host(s) use key authentication. Add a password "
+                f"in Edit if a host also needs one for sudo.",
+            )
+        if keyed and self._active is not None and self._connected():
+            self._log.log("Reconnect for an attached key to take effect.", "warn")
+
+    def _apply_import(self, chosen: list[ssh_config.ImportCandidate]) -> tuple[int, int]:
+        """Apply the chosen candidates. Returns ``(added, keys_attached)``."""
+        added = keyed = 0
+        for candidate in chosen:
+            config_host = candidate.host
+            if candidate.action == ssh_config.ACTION_ADD:
+                self._hosts.append(
+                    Host(
+                        hostname=config_host.hostname,
+                        username=config_host.user,
+                        port=config_host.port,
+                        label=config_host.alias,
+                        key_path=config_host.identity_file,
+                    )
+                )
+                added += 1
+            elif candidate.action == ssh_config.ACTION_ATTACH_KEY:
+                if 0 <= candidate.existing_index < len(self._hosts):
+                    self._hosts[candidate.existing_index].key_path = (
+                        config_host.identity_file
+                    )
+                    keyed += 1
+        return added, keyed
 
     # ──────────────────────────────────────────────────────────────────────────
     # Selection and connection
@@ -505,7 +582,7 @@ class App(ctk.CTk):
         self.after(0, lambda: self._on_os_info(host))
 
     def _on_os_info(self, host: Host) -> None:
-        save_hosts(self._hosts)
+        self._save_hosts_soon()
         self._log.log(f"{host.display_name} is running {host.os_pretty}.")
         if not distro.is_recognized(host.os_info, host.os_like):
             manager = self._package_manager(host)
@@ -548,7 +625,7 @@ class App(ctk.CTk):
             return  # Host was switched while the scan ran.
 
         host.stacks = stacks
-        save_hosts(self._hosts)
+        self._save_hosts_soon()
         self._populate_stacks(stacks)
         self._log.log(f"Found {len(stacks)} stack(s).", "success" if stacks else "warn")
 
@@ -904,7 +981,7 @@ class App(ctk.CTk):
 
     def _finish_bulk(self, action: str) -> None:
         self._set_bulk_enabled(True)
-        save_hosts(self._hosts)
+        self._save_hosts_soon()
         self._host_list.refresh()
         self._log.log(f"{action}: finished on all hosts.", "success")
 
@@ -921,10 +998,26 @@ class App(ctk.CTk):
         self._busy = busy
         self.configure(cursor="watch" if busy else "")
 
+    def _save_hosts_soon(self) -> None:
+        """Persist the host list without blocking the window.
+
+        The snapshot is taken here, on the UI thread, so it cannot tear; only the
+        disk write is deferred. Bursts — a bulk update check finishing on nine
+        hosts at once — collapse into a single write.
+        """
+        save_hosts_async(self._hosts, on_error=self._on_save_failed)
+
+    def _on_save_failed(self, error: Exception) -> None:
+        # Called from the writer thread; the log panel is safe to use from there.
+        self._log.log(f"Could not save host configuration: {error}", "error")
+
     def _on_close(self) -> None:
         self._disconnect()
         try:
+            # Synchronous on the way out, then wait for anything the background
+            # writer still holds: a deferred write must not die with the process.
             save_hosts(self._hosts)
+            flush_pending_saves()
         except OSError:
             pass  # Nothing useful to show; the window is already closing.
         self.destroy()

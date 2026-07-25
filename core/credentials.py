@@ -14,10 +14,14 @@ degrades the feature that needs it rather than taking the application down.
 
 import json
 import os
+import threading
 from pathlib import Path
+from typing import Callable, Optional
 
 import keyring
 import keyring.errors
+
+ErrorHandler = Callable[[Exception], None]
 
 _SERVICE_NAME = "DockerStackManager"
 
@@ -77,14 +81,38 @@ def delete_password(hostname: str, username: str) -> None:
 
 
 def save_hosts(hosts: list) -> None:
-    """Persist hosts to :data:`HOSTS_FILE`.
+    """Persist hosts to :data:`HOSTS_FILE`, synchronously.
 
     Writes to a sibling temp file and renames it over the target, so an
     interrupted write (or a crash mid-save) leaves the previous config intact
     rather than a truncated file the next launch cannot parse.
     """
+    _write_payload(serialize_hosts(hosts))
+
+
+def serialize_hosts(hosts: list) -> str:
+    """Render hosts to JSON. Cheap, and safe to call on the UI thread."""
+    return json.dumps([h.to_dict() for h in hosts], indent=2)
+
+
+def save_hosts_async(hosts: list, on_error: Optional[ErrorHandler] = None) -> None:
+    """Serialise now, write on a background thread.
+
+    Serialising on the calling thread is what makes this safe: the snapshot is
+    taken while the caller still owns the host objects, so a later mutation
+    cannot tear the file. Only the disk write — the slow part — is deferred.
+    Bursts coalesce, so a rapid sequence of edits costs one write.
+    """
+    _SAVER.submit(serialize_hosts(hosts), on_error)
+
+
+def flush_pending_saves(timeout: float = 5.0) -> None:
+    """Wait for any deferred write to finish. Call before exiting."""
+    _SAVER.flush(timeout)
+
+
+def _write_payload(payload: str) -> None:
     config_dir()
-    payload = json.dumps([h.to_dict() for h in hosts], indent=2)
     tmp = HOSTS_FILE.with_suffix(".json.tmp")
     try:
         tmp.write_text(payload, encoding="utf-8")
@@ -93,6 +121,56 @@ def save_hosts(hosts: list) -> None:
     except OSError:
         tmp.unlink(missing_ok=True)
         raise
+
+
+class _AsyncSaver:
+    """Writes the most recent payload on a single background thread.
+
+    Only the latest snapshot matters, so a burst of edits collapses to one write
+    rather than queueing several. The worker exits once it finds nothing pending,
+    and is restarted on the next submission.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: Optional[str] = None
+        self._on_error: Optional[ErrorHandler] = None
+        self._worker: Optional[threading.Thread] = None
+
+    def submit(self, payload: str, on_error: Optional[ErrorHandler]) -> None:
+        with self._lock:
+            self._pending = payload
+            self._on_error = on_error
+            if self._worker is None:
+                self._worker = threading.Thread(
+                    target=self._run, name="config-writer", daemon=True
+                )
+                self._worker.start()
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                payload, on_error = self._pending, self._on_error
+                self._pending = None
+                if payload is None:
+                    # Clearing this under the same lock submit() takes is what
+                    # stops a submission slipping in as the worker exits.
+                    self._worker = None
+                    return
+            try:
+                _write_payload(payload)
+            except OSError as exc:
+                if on_error is not None:
+                    on_error(exc)
+
+    def flush(self, timeout: float) -> None:
+        with self._lock:
+            worker = self._worker
+        if worker is not None:
+            worker.join(timeout)
+
+
+_SAVER = _AsyncSaver()
 
 
 def load_hosts() -> list[dict]:

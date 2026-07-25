@@ -18,6 +18,7 @@ shared.
 
 import base64
 import json
+import re
 import shlex
 import socket
 import time
@@ -30,7 +31,7 @@ import paramiko
 
 from core.credentials import KNOWN_HOSTS_FILE, config_dir
 from core.distro import OSInfo, PackageManager
-from models.host import Container, DockerStack
+from models.host import Container, DockerStack, ImageStatus
 
 LineSink = Callable[[str], None]
 """Receives one line of remote output at a time, without its trailing newline."""
@@ -280,15 +281,21 @@ class SSHClient:
             "auth_timeout": timeout,
             "banner_timeout": timeout,
         }
+        # A stored secret may be a login password, a key passphrase, or serve as
+        # both, so it is offered for either use. This matters when a key is added
+        # to a host that already authenticated by password: paramiko tries the
+        # key first and still falls back to the password, instead of the key
+        # being the only method and the host becoming unreachable.
+        if self.password:
+            kwargs["password"] = self.password
+
         if self.key_path:
             kwargs["key_filename"] = self.key_path
-            kwargs["look_for_keys"] = False
-            kwargs["allow_agent"] = False
             if self.password:
-                # With a key configured, the stored secret is its passphrase.
                 kwargs["passphrase"] = self.password
+            kwargs["look_for_keys"] = False
+            kwargs["allow_agent"] = True
         elif self.password:
-            kwargs["password"] = self.password
             kwargs["look_for_keys"] = False
             kwargs["allow_agent"] = False
         else:
@@ -698,12 +705,26 @@ class SSHClient:
         update turns into an outage.
         """
         on_line(f"── Updating {stack.name} ({stack.path}) ──")
-        if pull and not self.compose_action(stack, "pull", on_line):
-            on_line(
-                f"'{stack.name}' left running on its current images; "
-                f"nothing was recreated."
-            )
-            return False
+
+        if pull:
+            # Record what is running *before* the pull moves the tags. Without
+            # this there is no way back: the superseded image survives on disk
+            # but untagged, identifiable only by its ID.
+            snapshot = self.snapshot_images(stack)
+            if snapshot:
+                stack.image_snapshot = snapshot
+                stack.snapshot_taken = datetime.now().strftime("%Y-%m-%d %H:%M")
+                on_line(f"Recorded {len(snapshot)} image version(s) for rollback.")
+            else:
+                on_line("Could not record current image versions — no rollback point.")
+
+            if not self.compose_action(stack, "pull", on_line):
+                on_line(
+                    f"'{stack.name}' left running on its current images; "
+                    f"nothing was recreated."
+                )
+                return False
+
         return self.compose_action(stack, "up", on_line)
 
     def compose_action(self, stack: DockerStack, action: str, on_line: LineSink) -> bool:
@@ -776,6 +797,187 @@ class SSHClient:
             sudo=self._docker_needs_sudo(),
             timeout=LOG_FOLLOW_TIMEOUT,
         )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Image freshness and rollback
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def stack_images(self, stack: DockerStack) -> list[str]:
+        """Image references the stack's services use, per its compose file."""
+        compose = self._compose_command()
+        if not compose:
+            return []
+        result = self.run(
+            f"cd {shlex.quote(stack.path)} && {compose} config --images",
+            timeout=VALIDATE_TIMEOUT,
+        )
+        if not result.ok:
+            return []
+        return _unique(
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip() and not line.startswith(("WARN", "warning"))
+        )
+
+    def check_stack_images(self, stack: DockerStack) -> list[ImageStatus]:
+        """Compare each image's local digest with its registry digest.
+
+        Reports ``update_available=None`` rather than guessing whenever the
+        registry cannot be consulted — a false "up to date" would be worse than
+        an honest unknown, and a false "update available" trains you to ignore it.
+
+        No layers are downloaded: only manifests are fetched.
+        """
+        statuses: list[ImageStatus] = []
+        for image in self.stack_images(stack):
+            local = self._local_digests(image)
+            remote, detail = self._remote_digest(image)
+
+            if not remote:
+                statuses.append(
+                    ImageStatus(image, _first(local), "", None, detail)
+                )
+                continue
+            if not local:
+                statuses.append(
+                    ImageStatus(
+                        image, "", remote, None,
+                        "image not present locally — nothing to compare",
+                    )
+                )
+                continue
+
+            statuses.append(
+                ImageStatus(
+                    image,
+                    _first(local),
+                    remote,
+                    update_available=remote not in local,
+                    detail=detail,
+                )
+            )
+        return statuses
+
+    def _local_digests(self, image: str) -> set[str]:
+        """Every registry digest the local copy of ``image`` is known by."""
+        result = self.run(
+            f"{self._sudo_n_prefix()}docker image inspect "
+            f"--format '{{{{json .RepoDigests}}}}' {shlex.quote(image)}",
+            timeout=PROBE_TIMEOUT,
+        )
+        if not result.ok:
+            return set()
+        try:
+            entries = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            return set()
+        return {
+            str(entry).split("@", 1)[1]
+            for entry in entries or []
+            if isinstance(entry, str) and "@" in entry
+        }
+
+    def _remote_digest(self, image: str) -> tuple[str, str]:
+        """The digest the registry currently serves for this tag.
+
+        ``buildx imagetools`` is asked first because it reports the *index*
+        digest, which is what a multi-architecture image is recorded under
+        locally. Falling back to ``docker manifest inspect`` covers hosts without
+        buildx, at the cost of being unable to answer for some multi-arch images
+        — in which case this returns no digest and the caller reports unknown.
+        """
+        quoted = shlex.quote(image)
+        buildx = self.run(
+            f"{self._sudo_n_prefix()}docker buildx imagetools inspect "
+            f"--format '{{{{.Manifest.Digest}}}}' {quoted}",
+            timeout=CHECK_UPDATES_TIMEOUT,
+        )
+        digest = _find_digest(buildx.stdout)
+        if buildx.ok and digest:
+            return digest, "compared with the registry index digest"
+
+        manifest = self.run(
+            f"{self._sudo_n_prefix()}docker manifest inspect {quoted}",
+            timeout=CHECK_UPDATES_TIMEOUT,
+        )
+        if not manifest.ok:
+            reason = _first_line(manifest.stderr) or _first_line(buildx.stderr)
+            return "", reason or "could not reach the registry"
+        if '"manifests"' in manifest.stdout:
+            # A manifest list: its own digest is not in this output, and the
+            # per-platform digests would not match what is stored locally.
+            return "", "multi-architecture image and buildx is unavailable"
+        digest = _find_digest(manifest.stdout)
+        if digest:
+            return digest, "compared with the registry manifest digest"
+        return "", "registry response had no digest"
+
+    def snapshot_images(self, stack: DockerStack) -> dict[str, str]:
+        """Record each image's current ID, so a bad update can be undone.
+
+        IDs rather than tags: a pull moves the tag, leaving the previous image on
+        disk but untagged, and its ID is then the only way to name it.
+        """
+        snapshot: dict[str, str] = {}
+        for image in self.stack_images(stack):
+            result = self.run(
+                f"{self._sudo_n_prefix()}docker image inspect "
+                f"--format '{{{{.Id}}}}' {shlex.quote(image)}",
+                timeout=PROBE_TIMEOUT,
+            )
+            image_id = result.stdout.strip()
+            if result.ok and image_id.startswith("sha256:"):
+                snapshot[image] = image_id
+        return snapshot
+
+    def rollback_stack(
+        self, stack: DockerStack, snapshot: dict[str, str], on_line: LineSink
+    ) -> bool:
+        """Re-tag the recorded image IDs and bring the stack back up.
+
+        Fails without touching anything if any recorded image is no longer on the
+        host — a partial rollback would leave the stack in a state that matches
+        neither version. ``docker image prune`` is the usual reason for that, so
+        the message says so.
+        """
+        if not snapshot:
+            on_line("No previous image versions were recorded for this stack.")
+            return False
+
+        missing = [
+            image for image, image_id in snapshot.items()
+            if not self._image_id_present(image_id)
+        ]
+        if missing:
+            on_line(
+                f"Cannot roll back: the previous image for "
+                f"{', '.join(missing)} is no longer on the host."
+            )
+            on_line("A prune removes untagged images, which is what these become.")
+            return False
+
+        on_line(f"── Rolling back {stack.name} ──")
+        for image, image_id in snapshot.items():
+            on_line(f"{image} → {image_id[:19]}")
+            result = self.run(
+                f"{self._sudo_n_prefix()}docker tag {shlex.quote(image_id)} "
+                f"{shlex.quote(image)}",
+                timeout=PROBE_TIMEOUT,
+            )
+            if not result.ok:
+                on_line(f"Could not re-tag {image}: {result.stderr}")
+                return False
+
+        # Recreate so the containers actually pick the restored images up;
+        # a plain `up -d` may decide there is nothing to do.
+        return self.compose_action(stack, "recreate", on_line)
+
+    def _image_id_present(self, image_id: str) -> bool:
+        return self.run(
+            f"{self._sudo_n_prefix()}docker image inspect "
+            f"--format '{{{{.Id}}}}' {shlex.quote(image_id)}",
+            timeout=PROBE_TIMEOUT,
+        ).ok
 
     # ──────────────────────────────────────────────────────────────────────────
     # Compose file editing
@@ -1067,6 +1269,39 @@ def _reachability_error(hostname: str, port: int, timeout: int) -> str:
 
 def _reason(exc: OSError) -> str:
     return getattr(exc, "strerror", None) or str(exc) or exc.__class__.__name__
+
+
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def _find_digest(text: str) -> str:
+    """First ``sha256:…`` digest in some Docker output, or ``""``."""
+    match = _DIGEST_RE.search(text or "")
+    return match.group(0) if match else ""
+
+
+def _first(values) -> str:
+    for value in values:
+        return value
+    return ""
+
+
+def _first_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _unique(values) -> list[str]:
+    """De-duplicate while preserving order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
 
 
 def _without_sudo_prompt(text: str) -> str:

@@ -11,11 +11,14 @@ A desktop GUI for managing and updating Linux hosts and Docker Compose stacks ov
 - **Multi-host management** — add as many Linux hosts as you need; switch between them with one click
 - **Secure credentials** — passwords stored in the OS credential manager (Windows Credential Manager); never written to disk in plaintext
 - **SSH key support** — connect with a private key file instead of (or alongside) a password
-- **OS detection** — automatically identifies the Linux distribution on connect; colour-coded badge per distro
-- **Docker stack discovery** — scans the remote host for all `docker-compose.yml` / `compose.yml` files across common paths
+- **Host key verification** — a host's key is remembered the first time you connect, and a later *change* is reported instead of silently accepted
+- **OS detection** — identifies the distribution on connect, falling back to `ID_LIKE` so derivatives work too; colour-coded badge per distro
+- **Docker stack discovery** — combines what Docker itself reports with a pruned filesystem scan, so it finds both running projects and stacks that have never been started
 - **Selective stack updates** — checkboxes let you pick exactly which stacks to pull and recreate
-- **System package upgrades** — runs the correct package manager (`apt`, `dnf`, `pacman`, `apk`, `zypper`) for the detected OS
-- **Live log output** — streaming output panel shows real-time progress during updates
+- **System package upgrades** — runs the right package manager (`apt`, `dnf`, `pacman`, `apk`, `zypper`) for the detected OS
+- **Works as root or not** — detects passwordless `sudo` and whether your user can reach the Docker socket, and escalates only when it has to
+- **Bulk operations** — check for updates or run a full system update across every host at once, several hosts in parallel
+- **Live log output** — stack pulls and package upgrades stream line by line as they happen, and can be saved to a file
 
 ## Screenshots
 
@@ -58,21 +61,64 @@ python main.py
 4. Check or uncheck stacks, then click **Update Selected Stacks** to pull new images and recreate containers.
 5. Optionally click **System Update** to run a full OS package upgrade.
 
-## Credential storage
+Or skip straight to **Check All Updates** / **Update All Hosts** in the sidebar to work across every configured host at once.
 
-Passwords are stored in the **OS credential manager** (Windows Credential Manager on Windows). Host configuration (hostnames, usernames, ports, key paths) is saved to `~/.docker_stack_manager/hosts.json`. No credentials are ever written to that file or to the project directory.
+### What an update actually does
+
+Per selected stack, from the stack's own directory:
+
+```bash
+docker compose pull      # if this fails, the stack is left alone
+docker compose up -d
+```
+
+A failed pull deliberately aborts before `up`, because recreating containers against half-fetched images is how a routine update becomes an outage. Stack statuses are re-scanned when the run finishes.
+
+## Where things are stored
+
+| What | Where |
+| --- | --- |
+| Passwords and key passphrases | OS credential manager, under the service `DockerStackManager` |
+| Hosts, ports, key paths, discovered stacks | `~/.docker_stack_manager/hosts.json` |
+| Accepted SSH host keys | `~/.docker_stack_manager/known_hosts` |
+
+No credentials are ever written to `hosts.json` or to the project directory. The config file is written atomically — an interrupted save leaves the previous version intact rather than a truncated file — and a single malformed record is skipped at startup instead of stopping the app.
 
 ## Supported Linux distributions
 
 | Distro family | Package manager |
 | --- | --- |
-| Ubuntu, Debian, Mint, Pop!\_OS | `apt-get` |
-| Fedora, RHEL, CentOS, Rocky, AlmaLinux | `dnf` / `yum` |
-| Arch, Manjaro, EndeavourOS | `pacman` |
+| Debian, Ubuntu, Mint, Pop!\_OS, Raspbian, Kali, Devuan, elementary | `apt-get` |
+| Fedora, RHEL, CentOS, Rocky, AlmaLinux, Oracle, Amazon Linux | `dnf` / `yum` |
+| Arch, Manjaro, EndeavourOS, Garuda | `pacman` |
 | Alpine | `apk` |
-| openSUSE | `zypper` |
+| openSUSE, SLES | `zypper` |
 
-## Project structure
+Anything else falls back to its `ID_LIKE` family, and finally to `apt-get`. Unrecognised distros are called out in the log so the guess is visible rather than silent.
+
+## Privileges
+
+System updates need root. The app works this out per host, in order:
+
+1. Logged in as `root` — commands run directly.
+2. Passwordless `sudo` available — uses `sudo -n`, and your stored password never goes over the wire.
+3. Otherwise — the stored password is fed to `sudo -S` on stdin.
+
+Docker commands follow the same idea: if your user cannot reach the Docker socket (not in the `docker` group), stack operations are escalated automatically.
+
+> **Key-only hosts:** if a host authenticates with an SSH key and has no stored password, there is nothing to give `sudo`. Either configure passwordless `sudo` for that user or log in as `root`. The log says so explicitly rather than hanging on an invisible prompt.
+
+## Troubleshooting
+
+| Symptom | Cause |
+| --- | --- |
+| *"Host key … has changed"* | The server was rebuilt, or the connection is being intercepted. Verify, then remove the stale line from `~/.docker_stack_manager/known_hosts`. |
+| *"Authentication failed"* | Wrong password, or a key whose passphrase is not the stored one. |
+| System update fails immediately | No route to root — see [Privileges](#privileges). |
+| No stacks found | Compose files live outside the scanned roots (`/opt`, `/srv`, `/home`, `/root`, `/docker`, `/stacks`, `/data`). A full-tree scan runs automatically if the first pass finds nothing. |
+| Update count looks stale | Counts come from the package lists already on the host; refreshing them needs root. Run a system update to resynchronise. |
+
+## Architecture
 
 ```text
 DockerStackManager/
@@ -82,13 +128,21 @@ DockerStackManager/
 ├── models/
 │   └── host.py           # Host and DockerStack data models
 ├── core/
-│   ├── credentials.py    # Secure credential storage
-│   └── ssh_client.py     # SSH connection, OS detection, stack ops
+│   ├── distro.py         # Per-distro package-manager commands and badge colours
+│   ├── credentials.py    # Keyring secrets + atomic config persistence
+│   └── ssh_client.py     # SSH transport: connect, probe, run, stream
 └── gui/
-    ├── app.py            # Main application window
+    ├── app.py            # Main window and action coordination
+    ├── host_list.py      # Sidebar host cards
     ├── host_dialog.py    # Add/Edit host dialog
-    └── log_panel.py      # Scrollable output log
+    └── log_panel.py      # Batched, thread-safe output log
 ```
+
+Two conventions hold the layers apart and are worth preserving:
+
+**Distro knowledge lives only in `core/distro.py`.** `ssh_client` knows how to *run* a command, never *which* command; it is handed a `PackageManager` and executes its strings. Supporting a new distro is a one-line table entry, not a new branch in an `if`/`elif` chain.
+
+**Nothing blocks the UI thread.** Every network call runs on a worker thread and returns via `after()`. The one exception is logging: `LogPanel.log` is safe to call from any thread because it only enqueues, and a single timer drains the queue with one batched widget insert per tick — which is what keeps the window responsive while `apt` streams thousands of lines.
 
 ## License
 

@@ -1,37 +1,63 @@
+"""Main application window.
+
+The window owns the host list, one optional SSH session to the *selected* host,
+and the output log. Anything that touches the network runs on a worker thread
+and comes back through :meth:`tkinter.Misc.after`; log lines are the exception,
+since :class:`~gui.log_panel.LogPanel` is itself thread-safe.
+
+Bulk actions ("all hosts") each open their own short-lived connection, so they
+are independent of whatever the selected host is doing.
+"""
+
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Optional
+
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox
 
-from models.host import Host, DockerStack
+from core import distro
 from core.credentials import (
-    save_password, get_password, delete_password,
-    save_hosts, load_hosts,
+    delete_password,
+    get_password,
+    load_hosts,
+    save_hosts,
+    save_password,
 )
 from core.ssh_client import SSHClient
 from gui.host_dialog import HostDialog
+from gui.host_list import HostList, os_badge_color
 from gui.log_panel import LogPanel
+from models.host import UPDATES_FAILED, UPDATES_UNKNOWN, DockerStack, Host
 
-OS_COLORS = {
-    "ubuntu": "#E95420",
-    "debian": "#A80030",
-    "fedora": "#3C6EB4",
-    "centos": "#932279",
-    "rhel": "#EE0000",
-    "rocky": "#10B981",
-    "almalinux": "#083F8A",
-    "arch": "#1793D1",
-    "manjaro": "#35BF5C",
-    "alpine": "#0D597F",
-    "opensuse": "#73BA25",
+MAX_PARALLEL_HOSTS = 8
+"""Cap on concurrent SSH sessions during a bulk action.
+
+One thread per host stops being an optimisation somewhere around a dozen hosts;
+past that it is just contention and a fan of simultaneous auth attempts.
+"""
+
+#: Stack status -> (icon, colour).
+STACK_STATUS = {
+    "running": ("●", "#4CAF50"),
+    "partial": ("◑", "#FFA500"),
+    "stopped": ("○", "#888888"),
+    "unknown": ("?", "#AAAAAA"),
 }
-DEFAULT_OS_COLOR = "#555577"
 
-STATUS_ICONS = {"running": "●", "stopped": "○", "partial": "◑", "unknown": "?"}
-STATUS_COLORS = {"running": "#4CAF50", "stopped": "#888888", "partial": "#FFA500", "unknown": "#AAAAAA"}
+_ACCENT_PURPLE = "#7B5EA7"
+_ACCENT_PURPLE_HOVER = "#6A4D96"
+_ACCENT_BLUE = "#2B5278"
+_ACCENT_BLUE_HOVER = "#1E3D5C"
+
+Logger = Callable[..., None]
+HostWorker = Callable[[Host, SSHClient, Logger], None]
 
 
 class App(ctk.CTk):
+    """The application window."""
+
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("dark")
@@ -41,608 +67,735 @@ class App(ctk.CTk):
         self.geometry("1200x760")
         self.minsize(900, 600)
 
-        self._hosts: list[Host] = []
-        self._active_host: Host | None = None
-        self._ssh: SSHClient | None = None
+        self._hosts, skipped = _read_hosts()
+        self._active: Optional[Host] = None
+        self._ssh: Optional[SSHClient] = None
         self._stack_vars: dict[str, tk.BooleanVar] = {}
         self._busy = False
 
-        raw = load_hosts()
-        self._hosts = [Host.from_dict(d) for d in raw]
-
         self._build_ui()
+        self._host_list.set_hosts(self._hosts)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self._log.log(f"Loaded {len(self._hosts)} host(s).")
+        if skipped:
+            self._log.log(
+                f"Ignored {skipped} unreadable host entr"
+                f"{'y' if skipped == 1 else 'ies'} in the config file.",
+                "warn",
+            )
+
     # ──────────────────────────────────────────────────────────────────────────
-    # UI Construction
+    # UI construction
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # Left sidebar
+        self._build_sidebar()
+
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
+        content.grid_rowconfigure(1, weight=1)
+        content.grid_columnconfigure(0, weight=1)
+
+        self._build_header(content)
+
+        split = ctk.CTkFrame(content, fg_color="transparent")
+        split.grid(row=1, column=0, sticky="nsew")
+        split.grid_rowconfigure(0, weight=1)
+        split.grid_columnconfigure(0, weight=2)
+        split.grid_columnconfigure(1, weight=3)
+
+        self._build_stack_panel(split)
+
+        self._log = LogPanel(split)
+        self._log.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+
+    def _build_sidebar(self) -> None:
         sidebar = ctk.CTkFrame(self, width=240, corner_radius=0)
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
         sidebar.grid_rowconfigure(1, weight=1)
 
         ctk.CTkLabel(
-            sidebar, text="Hosts", font=ctk.CTkFont(size=16, weight="bold"),
+            sidebar, text="Hosts", font=ctk.CTkFont(size=16, weight="bold")
         ).grid(row=0, column=0, padx=12, pady=(14, 4), sticky="w")
 
-        self._host_list_frame = ctk.CTkScrollableFrame(sidebar, label_text="")
-        self._host_list_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
-        self._host_list_frame.grid_columnconfigure(0, weight=1)
+        self._host_list = HostList(
+            sidebar,
+            on_select=self._select_host,
+            on_edit=self._edit_host,
+            on_remove=self._remove_host,
+        )
+        self._host_list.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
 
-        btn_row = ctk.CTkFrame(sidebar, fg_color="transparent")
-        btn_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 0))
-        ctk.CTkButton(btn_row, text="+ Add Host", command=self._add_host).pack(fill="x")
+        ctk.CTkButton(sidebar, text="+ Add Host", command=self._add_host).grid(
+            row=2, column=0, sticky="ew", padx=8, pady=(4, 0)
+        )
 
-        bulk_row = ctk.CTkFrame(sidebar, fg_color="transparent")
-        bulk_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 8))
+        bulk = ctk.CTkFrame(sidebar, fg_color="transparent")
+        bulk.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 8))
         self._btn_check_all = ctk.CTkButton(
-            bulk_row, text="Check All Updates",
-            fg_color="#2B5278", hover_color="#1E3D5C",
+            bulk,
+            text="Check All Updates",
+            fg_color=_ACCENT_BLUE,
+            hover_color=_ACCENT_BLUE_HOVER,
             command=self._check_all_updates,
         )
         self._btn_check_all.pack(fill="x", pady=(0, 4))
         self._btn_update_all = ctk.CTkButton(
-            bulk_row, text="Update All Hosts",
-            fg_color="#7B5EA7", hover_color="#6A4D96",
+            bulk,
+            text="Update All Hosts",
+            fg_color=_ACCENT_PURPLE,
+            hover_color=_ACCENT_PURPLE_HOVER,
             command=self._update_all_hosts,
         )
         self._btn_update_all.pack(fill="x")
 
-        # Right content
-        content = ctk.CTkFrame(self, fg_color="transparent")
-        content.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
-        content.grid_rowconfigure(1, weight=1)
-        content.grid_columnconfigure(0, weight=1)
-
-        # Host info bar
-        self._info_bar = ctk.CTkFrame(content, height=60)
-        self._info_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        self._info_bar.grid_propagate(False)
-        self._info_bar.grid_columnconfigure(1, weight=1)
+    def _build_header(self, parent) -> None:
+        bar = ctk.CTkFrame(parent, height=60)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        bar.grid_propagate(False)
+        bar.grid_columnconfigure(1, weight=1)
 
         self._host_title = ctk.CTkLabel(
-            self._info_bar, text="Select a host", font=ctk.CTkFont(size=18, weight="bold"),
+            bar, text="Select a host", font=ctk.CTkFont(size=18, weight="bold")
         )
         self._host_title.grid(row=0, column=0, padx=14, pady=4, sticky="w")
 
         self._os_badge = ctk.CTkLabel(
-            self._info_bar, text="", fg_color=DEFAULT_OS_COLOR, corner_radius=8, padx=8,
+            bar,
+            text="",
+            fg_color=distro.DEFAULT_BRAND_COLOR,
+            corner_radius=8,
+            padx=8,
         )
         self._os_badge.grid(row=0, column=1, padx=4, pady=4, sticky="w")
 
-        action_row = ctk.CTkFrame(self._info_bar, fg_color="transparent")
-        action_row.grid(row=0, column=2, padx=8, pady=4, sticky="e")
+        actions = ctk.CTkFrame(bar, fg_color="transparent")
+        actions.grid(row=0, column=2, padx=8, pady=4, sticky="e")
 
         self._btn_connect = ctk.CTkButton(
-            action_row, text="Connect", width=100, command=self._toggle_connect
+            actions, text="Connect", width=100, command=self._toggle_connect
         )
         self._btn_connect.pack(side="left", padx=4)
 
         self._btn_scan = ctk.CTkButton(
-            action_row, text="Scan Stacks", width=110,
-            command=self._scan_stacks, state="disabled"
+            actions,
+            text="Scan Stacks",
+            width=110,
+            command=self._scan_stacks,
+            state="disabled",
         )
         self._btn_scan.pack(side="left", padx=4)
 
         self._btn_sys_update = ctk.CTkButton(
-            action_row, text="System Update", width=120,
-            fg_color="#7B5EA7", hover_color="#6A4D96",
-            command=self._run_system_update, state="disabled"
+            actions,
+            text="System Update",
+            width=120,
+            fg_color=_ACCENT_PURPLE,
+            hover_color=_ACCENT_PURPLE_HOVER,
+            command=self._run_system_update,
+            state="disabled",
         )
         self._btn_sys_update.pack(side="left", padx=4)
 
-        # Main split: stacks + log
-        main_split = ctk.CTkFrame(content, fg_color="transparent")
-        main_split.grid(row=1, column=0, sticky="nsew")
-        main_split.grid_rowconfigure(0, weight=1)
-        main_split.grid_columnconfigure(0, weight=2)
-        main_split.grid_columnconfigure(1, weight=3)
+    def _build_stack_panel(self, parent) -> None:
+        panel = ctk.CTkFrame(parent)
+        panel.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        panel.grid_rowconfigure(1, weight=1)
+        panel.grid_columnconfigure(0, weight=1)
 
-        # Stack panel
-        stack_panel = ctk.CTkFrame(main_split)
-        stack_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-        stack_panel.grid_rowconfigure(1, weight=1)
-        stack_panel.grid_columnconfigure(0, weight=1)
+        header = ctk.CTkFrame(panel, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        ctk.CTkLabel(
+            header, text="Docker Stacks", font=ctk.CTkFont(weight="bold")
+        ).pack(side="left")
 
-        sp_header = ctk.CTkFrame(stack_panel, fg_color="transparent")
-        sp_header.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        ctk.CTkLabel(sp_header, text="Docker Stacks", font=ctk.CTkFont(weight="bold")).pack(side="left")
-
-        sp_btns = ctk.CTkFrame(sp_header, fg_color="transparent")
-        sp_btns.pack(side="right")
+        toggles = ctk.CTkFrame(header, fg_color="transparent")
+        toggles.pack(side="right")
         ctk.CTkButton(
-            sp_btns, text="All", width=44, height=24,
-            command=lambda: self._select_all_stacks(True)
+            toggles, text="All", width=44, height=24,
+            command=lambda: self._select_all_stacks(True),
         ).pack(side="left", padx=2)
         ctk.CTkButton(
-            sp_btns, text="None", width=44, height=24,
-            command=lambda: self._select_all_stacks(False)
+            toggles, text="None", width=44, height=24,
+            command=lambda: self._select_all_stacks(False),
         ).pack(side="left", padx=2)
 
-        self._stack_scroll = ctk.CTkScrollableFrame(stack_panel, label_text="")
+        self._stack_scroll = ctk.CTkScrollableFrame(panel, label_text="")
         self._stack_scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
         self._stack_scroll.grid_columnconfigure(0, weight=1)
 
         self._btn_update_stacks = ctk.CTkButton(
-            stack_panel, text="Update Selected Stacks",
-            state="disabled", command=self._update_selected_stacks,
+            panel,
+            text="Update Selected Stacks",
+            state="disabled",
+            command=self._update_selected_stacks,
         )
         self._btn_update_stacks.grid(row=2, column=0, padx=8, pady=8, sticky="ew")
-
-        self._log = LogPanel(main_split)
-        self._log.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
-
-        self._refresh_host_list()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Host management
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _add_host(self):
-        dlg = HostDialog(self)
-        self.wait_window(dlg)
-        if not dlg.result:
+    def _add_host(self) -> None:
+        result = self._ask_host()
+        if not result:
             return
-        r = dlg.result
         host = Host(
-            hostname=r["hostname"],
-            username=r["username"],
-            port=r["port"],
-            label=r["label"],
-            key_path=r["key_path"],
+            hostname=result["hostname"],
+            username=result["username"],
+            port=result["port"],
+            label=result["label"],
+            key_path=result["key_path"],
         )
-        if r["password"]:
-            save_password(host.hostname, host.username, r["password"])
+        if result["password"]:
+            save_password(host.hostname, host.username, result["password"])
         self._hosts.append(host)
         save_hosts(self._hosts)
-        self._refresh_host_list()
+        self._host_list.set_hosts(self._hosts)
         self._select_host(host)
 
-    def _edit_host(self, host: Host):
-        dlg = HostDialog(self, host=host)
-        self.wait_window(dlg)
-        if not dlg.result:
+    def _edit_host(self, host: Host) -> None:
+        result = self._ask_host(host)
+        if not result:
             return
-        r = dlg.result
-        old_key = (host.hostname, host.username)
-        host.hostname = r["hostname"]
-        host.username = r["username"]
-        host.port = r["port"]
-        host.label = r["label"]
-        host.key_path = r["key_path"]
-        if r["password"]:
-            delete_password(*old_key)
-            save_password(host.hostname, host.username, r["password"])
-        save_hosts(self._hosts)
-        self._refresh_host_list()
-        if self._active_host is host:
-            self._host_title.configure(text=host.display_name)
 
-    def _remove_host(self, host: Host):
-        if not messagebox.askyesno("Remove Host", f"Remove '{host.display_name}'?", parent=self):
+        old_account = (host.hostname, host.username)
+        new_account = (result["hostname"], result["username"])
+        moved = new_account != old_account
+        carried = get_password(*old_account) if moved else ""
+
+        address_changed = new_account[0] != old_account[0] or result["port"] != host.port
+        if address_changed and host is self._active:
+            self._disconnect()
+
+        host.hostname, host.username = new_account
+        host.port = result["port"]
+        host.label = result["label"]
+        host.key_path = result["key_path"]
+
+        # Keep the stored secret attached to the account it belongs to. Renaming
+        # a host used to strand its password under the old user@host key, so the
+        # next connect failed with no obvious cause.
+        if moved and carried:
+            delete_password(*old_account)
+        secret = result["password"] or carried
+        if secret:
+            save_password(*new_account, secret)
+
+        if new_account[0] != old_account[0]:
+            # A different address is a different machine: what we learned about
+            # the old one no longer applies.
+            host.os_info = host.os_pretty = host.os_like = ""
+            host.stacks = []
+            host.pending_updates = UPDATES_UNKNOWN
+
+        save_hosts(self._hosts)
+        self._host_list.set_hosts(self._hosts)
+        self._host_list.set_active(self._active)
+        if host is self._active:
+            self._show_host(host)
+
+    def _remove_host(self, host: Host) -> None:
+        if not messagebox.askyesno(
+            "Remove Host", f"Remove '{host.display_name}'?", parent=self
+        ):
             return
-        if self._active_host is host:
-            self._disconnect_ssh()
-            self._active_host = None
-            self._clear_stack_panel()
+        if host is self._active:
+            self._disconnect()
+            self._active = None
+            self._clear_stacks()
             self._host_title.configure(text="Select a host")
-            self._os_badge.configure(text="")
-        delete_password(host.hostname, host.username)
+            self._os_badge.configure(text="", fg_color=distro.DEFAULT_BRAND_COLOR)
+
         self._hosts.remove(host)
+        # Credentials are keyed by user@host, which two entries may share.
+        if not any(
+            (h.hostname, h.username) == (host.hostname, host.username)
+            for h in self._hosts
+        ):
+            delete_password(host.hostname, host.username)
+
         save_hosts(self._hosts)
-        self._refresh_host_list()
+        self._host_list.set_hosts(self._hosts)
+        self._host_list.set_active(self._active)
 
-    def _refresh_host_list(self):
-        for w in self._host_list_frame.winfo_children():
-            w.destroy()
-
-        for host in self._hosts:
-            card = ctk.CTkFrame(self._host_list_frame, corner_radius=8)
-            card.pack(fill="x", pady=3)
-            card.grid_columnconfigure(0, weight=1)
-            card.configure(fg_color="#1E6B9E" if host is self._active_host else "transparent")
-
-            inner = ctk.CTkFrame(card, fg_color="transparent")
-            inner.grid(row=0, column=0, sticky="ew", padx=6, pady=4)
-            inner.grid_columnconfigure(0, weight=1)
-
-            ctk.CTkLabel(inner, text=host.display_name, font=ctk.CTkFont(weight="bold"), anchor="w").grid(
-                row=0, column=0, sticky="w"
-            )
-
-            sub = f"{host.username}@{host.hostname}"
-            if host.port != 22:
-                sub += f":{host.port}"
-            ctk.CTkLabel(inner, text=sub, font=ctk.CTkFont(size=11), text_color="gray70", anchor="w").grid(
-                row=1, column=0, sticky="w"
-            )
-
-            if host.os_pretty:
-                ctk.CTkLabel(inner, text=host.os_pretty, font=ctk.CTkFont(size=11), text_color="gray60", anchor="w").grid(
-                    row=2, column=0, sticky="w"
-                )
-
-            if host.pending_updates > 0:
-                ctk.CTkLabel(
-                    inner,
-                    text=f"⬆ {host.pending_updates} update{'s' if host.pending_updates != 1 else ''} available",
-                    font=ctk.CTkFont(size=11),
-                    text_color="#FFA040",
-                    anchor="w",
-                ).grid(row=3, column=0, sticky="w")
-            elif host.pending_updates == 0:
-                ctk.CTkLabel(
-                    inner, text="✓ Up to date",
-                    font=ctk.CTkFont(size=11), text_color="#4CAF50", anchor="w",
-                ).grid(row=3, column=0, sticky="w")
-
-            btn_frame = ctk.CTkFrame(card, fg_color="transparent")
-            btn_frame.grid(row=0, column=1, padx=4, pady=4)
-            ctk.CTkButton(btn_frame, text="✎", width=28, height=28, command=lambda h=host: self._edit_host(h)).pack(pady=1)
-            ctk.CTkButton(
-                btn_frame, text="✕", width=28, height=28,
-                fg_color="#883333", hover_color="#aa4444",
-                command=lambda h=host: self._remove_host(h),
-            ).pack(pady=1)
-
-            for widget in (card, inner) + tuple(inner.winfo_children()):
-                widget.bind("<Button-1>", lambda e, h=host: self._select_host(h))
+    def _ask_host(self, host: Optional[Host] = None) -> Optional[dict]:
+        dialog = HostDialog(self, host=host)
+        self.wait_window(dialog)
+        return dialog.result
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Host selection & connection
+    # Selection and connection
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _select_host(self, host: Host):
-        if self._busy or self._active_host is host:
+    def _select_host(self, host: Host) -> None:
+        if self._busy or host is self._active:
             return
-        self._disconnect_ssh()
-        self._active_host = host
-        self._refresh_host_list()
-        self._host_title.configure(text=host.display_name)
-        self._os_badge.configure(
-            text=host.os_pretty or "Unknown OS",
-            fg_color=OS_COLORS.get(host.os_info, DEFAULT_OS_COLOR),
-        )
-        self._btn_connect.configure(text="Connect", state="normal")
-        self._btn_scan.configure(state="disabled")
-        self._btn_sys_update.configure(state="disabled")
+        self._disconnect()
+        self._active = host
+        self._host_list.set_active(host)
+        self._show_host(host)
         self._btn_update_stacks.configure(state="disabled")
-        self._clear_stack_panel()
         self._populate_stacks(host.stacks)
 
-    def _toggle_connect(self):
-        if not self._active_host:
-            return
-        if self._ssh and self._ssh.is_connected:
-            self._disconnect_ssh()
-        else:
-            self._connect_ssh()
+    def _show_host(self, host: Host) -> None:
+        self._host_title.configure(text=host.display_name)
+        self._os_badge.configure(
+            text=host.os_pretty or "Unknown OS", fg_color=os_badge_color(host)
+        )
 
-    def _connect_ssh(self):
-        host = self._active_host
-        password = get_password(host.hostname, host.username) or ""
-        if not host.key_path and not password:
-            messagebox.showerror("No credentials", f"No saved password or SSH key for {host.display_name}.", parent=self)
+    def _toggle_connect(self) -> None:
+        if self._active is None:
+            return
+        if self._connected():
+            self._disconnect()
+            self._log.log(f"Disconnected from {self._active.display_name}.")
+        else:
+            self._connect()
+
+    def _connect(self) -> None:
+        host = self._active
+        if host is None:
+            return
+
+        ssh = self._client_for(host)
+        if not host.key_path and not ssh.password:
+            messagebox.showerror(
+                "No credentials",
+                f"No saved password or SSH key for {host.display_name}.\n"
+                f"Edit the host to add one.",
+                parent=self,
+            )
             return
 
         self._set_busy(True)
-        self._log.log(f"Connecting to {host.display_name} ({host.hostname}:{host.port})…")
-        if host.key_path:
-            self._log.log(f"Using key: {host.key_path}")
         self._btn_connect.configure(text="Connecting…", state="disabled")
+        self._log.log(f"Connecting to {host.display_name} ({host.address})…")
+        if host.key_path:
+            self._log.log(f"Using key {host.key_path}")
 
-        ssh = SSHClient(host.hostname, host.username, password, host.port, key_path=host.key_path)
+        def task() -> None:
+            ok, message = ssh.connect()
+            self.after(0, lambda: self._on_connected(host, ssh, ok, message))
 
-        def task():
-            ok, msg = ssh.connect()
-            self.after(0, lambda: self._on_connected(ssh, ok, msg))
+        _run_in_thread(task)
 
-        threading.Thread(target=task, daemon=True).start()
-
-    def _on_connected(self, ssh: SSHClient, ok: bool, msg: str):
+    def _on_connected(self, host: Host, ssh: SSHClient, ok: bool, message: str) -> None:
         self._set_busy(False)
+        if host is not self._active:
+            ssh.disconnect()  # Selection moved on while we were connecting.
+            return
         if not ok:
-            self._log.log(f"Connection failed: {msg}", "error")
+            self._log.log(f"Connection failed: {message}", "error")
             self._btn_connect.configure(text="Connect", state="normal")
             return
+
         self._ssh = ssh
-        self._log.log("Connected.", "success")
+        self._log.log(f"Connected to {host.display_name}.", "success")
         self._btn_connect.configure(text="Disconnect", state="normal")
         self._btn_scan.configure(state="normal")
         self._btn_sys_update.configure(state="normal")
-        if not self._active_host.os_pretty:
-            self._detect_os()
+        if host.stacks:
+            self._btn_update_stacks.configure(state="normal")
+        _run_in_thread(lambda: self._ensure_os_info(host, ssh))
 
-    def _disconnect_ssh(self):
-        if self._ssh:
+    def _disconnect(self) -> None:
+        if self._ssh is not None:
             self._ssh.disconnect()
             self._ssh = None
         self._btn_connect.configure(text="Connect", state="normal")
-        self._btn_scan.configure(state="disabled")
+        self._btn_scan.configure(text="Scan Stacks", state="disabled")
         self._btn_sys_update.configure(state="disabled")
+        self._btn_update_stacks.configure(state="disabled")
 
-    def _detect_os(self):
-        host = self._active_host
-        ssh = self._ssh  # capture now — avoids use-after-disconnect in thread
-        if not ssh:
+    def _session(self) -> Optional[tuple[Host, SSHClient]]:
+        """The selected host paired with its live session, or ``None``.
+
+        Every action that talks to the selected host starts here, so the "are we
+        still connected?" check and the unpacking happen in one place.
+        """
+        host, ssh = self._active, self._ssh
+        if host is None or ssh is None or not ssh.is_connected:
+            return None
+        return host, ssh
+
+    def _connected(self) -> bool:
+        return self._session() is not None
+
+    def _client_for(self, host: Host) -> SSHClient:
+        return SSHClient(
+            host.hostname,
+            host.username,
+            get_password(host.hostname, host.username),
+            host.port,
+            key_path=host.key_path,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # OS detection
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _ensure_os_info(self, host: Host, ssh: SSHClient) -> None:
+        """Detect and remember the host's distro. Runs on a worker thread.
+
+        The fields are assigned here rather than from the Tk callback because
+        callers need them immediately to pick a package manager — deferring the
+        assignment to ``after()`` meant a host's first update check always fell
+        back to the default manager, whatever distro had just been detected.
+        """
+        if host.os_info or host.os_pretty:
             return
+        info = ssh.detect_os()
+        host.os_info, host.os_pretty, host.os_like = info.id, info.pretty, info.like
+        self.after(0, lambda: self._on_os_info(host))
 
-        def task():
-            os_id, pretty = ssh.detect_os()
-            self.after(0, lambda: self._on_os_detected(host, os_id, pretty))
-
-        threading.Thread(target=task, daemon=True).start()
-
-    def _on_os_detected(self, host: Host, os_id: str, pretty: str):
-        host.os_info = os_id
-        host.os_pretty = pretty
+    def _on_os_info(self, host: Host) -> None:
         save_hosts(self._hosts)
-        self._os_badge.configure(text=pretty, fg_color=OS_COLORS.get(os_id, DEFAULT_OS_COLOR))
-        self._log.log(f"OS detected: {pretty}", "info")
-        self._refresh_host_list()
+        self._log.log(f"{host.display_name} is running {host.os_pretty}.")
+        if not distro.is_recognized(host.os_info, host.os_like):
+            manager = self._package_manager(host)
+            self._log.log(
+                f"Unrecognised distribution — assuming {manager.name} for updates.",
+                "warn",
+            )
+        if host is self._active:
+            self._show_host(host)
+        self._host_list.refresh()
+
+    @staticmethod
+    def _package_manager(host: Host) -> distro.PackageManager:
+        return distro.resolve(host.os_info, host.os_like)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Stack management
+    # Stacks
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _scan_stacks(self):
-        if not self._ssh or not self._active_host:
+    def _scan_stacks(self) -> None:
+        session = self._session()
+        if session is None:
             return
+        host, ssh = session
         self._set_busy(True)
         self._btn_scan.configure(state="disabled", text="Scanning…")
-        self._log.log("Scanning for Docker stacks…")
 
-        host = self._active_host
-        ssh = self._ssh
-
-        def task():
-            stacks = ssh.find_docker_stacks(
-                log_cb=lambda m: self.after(0, lambda msg=m: self._log.log(msg))
-            )
+        def task() -> None:
+            stacks = ssh.find_docker_stacks(self._log.log)
             self.after(0, lambda: self._on_stacks_found(host, stacks))
 
-        threading.Thread(target=task, daemon=True).start()
+        _run_in_thread(task)
 
-    def _on_stacks_found(self, host: Host, stacks: list[DockerStack]):
+    def _on_stacks_found(self, host: Host, stacks: list[DockerStack]) -> None:
         self._set_busy(False)
-        self._btn_scan.configure(state="normal", text="Scan Stacks")
-        # Guard: user may have switched hosts while scan was running
-        if host is not self._active_host:
-            return
+        self._btn_scan.configure(
+            text="Scan Stacks", state="normal" if self._connected() else "disabled"
+        )
+        if host is not self._active:
+            return  # Host was switched while the scan ran.
+
         host.stacks = stacks
         save_hosts(self._hosts)
-        self._clear_stack_panel()
         self._populate_stacks(stacks)
-        self._log.log(f"Found {len(stacks)} stack(s).", "success")
-        if stacks:
-            self._btn_update_stacks.configure(state="normal")
+        self._log.log(f"Found {len(stacks)} stack(s).", "success" if stacks else "warn")
 
-    def _clear_stack_panel(self):
-        for w in self._stack_scroll.winfo_children():
-            w.destroy()
-        self._stack_vars.clear()
-
-    def _populate_stacks(self, stacks: list[DockerStack]):
-        self._clear_stack_panel()
+    def _populate_stacks(self, stacks: list[DockerStack]) -> None:
+        self._clear_stacks()
         if not stacks:
             ctk.CTkLabel(
                 self._stack_scroll,
-                text="No stacks found.\nConnect and scan to discover.",
+                text="No stacks found.\nConnect and scan to discover them.",
                 text_color="gray60",
             ).pack(pady=20)
             return
         for stack in stacks:
             self._add_stack_row(stack)
-        if self._ssh and self._ssh.is_connected:
+        if self._connected():
             self._btn_update_stacks.configure(state="normal")
 
-    def _add_stack_row(self, stack: DockerStack):
-        var = tk.BooleanVar(value=True)
-        self._stack_vars[stack.path] = var
+    def _clear_stacks(self) -> None:
+        for widget in self._stack_scroll.winfo_children():
+            widget.destroy()
+        self._stack_vars.clear()
+
+    def _add_stack_row(self, stack: DockerStack) -> None:
+        selected = tk.BooleanVar(value=True)
+        self._stack_vars[stack.path] = selected
 
         row = ctk.CTkFrame(self._stack_scroll, corner_radius=6)
         row.pack(fill="x", pady=2)
         row.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkCheckBox(row, text="", variable=var, width=24).grid(row=0, column=0, padx=(8, 2), pady=6)
+        ctk.CTkCheckBox(row, text="", variable=selected, width=24).grid(
+            row=0, column=0, padx=(8, 2), pady=6
+        )
 
         info = ctk.CTkFrame(row, fg_color="transparent")
         info.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
-        ctk.CTkLabel(info, text=stack.name, font=ctk.CTkFont(weight="bold"), anchor="w").pack(fill="x")
-        ctk.CTkLabel(info, text=stack.path, font=ctk.CTkFont(size=11), text_color="gray60", anchor="w").pack(fill="x")
+        ctk.CTkLabel(
+            info, text=stack.name, font=ctk.CTkFont(weight="bold"), anchor="w"
+        ).pack(fill="x")
+        ctk.CTkLabel(
+            info,
+            text=stack.path,
+            font=ctk.CTkFont(size=11),
+            text_color="gray60",
+            anchor="w",
+        ).pack(fill="x")
 
-        icon = STATUS_ICONS.get(stack.status, "?")
-        color = STATUS_COLORS.get(stack.status, "#AAAAAA")
-        ctk.CTkLabel(row, text=f"{icon} {stack.status}", text_color=color, font=ctk.CTkFont(size=12)).grid(
-            row=0, column=2, padx=10
-        )
+        icon, color = STACK_STATUS.get(stack.status, STACK_STATUS["unknown"])
+        ctk.CTkLabel(
+            row,
+            text=f"{icon} {stack.status}",
+            text_color=color,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=2, padx=10)
 
-    def _select_all_stacks(self, value: bool):
+    def _select_all_stacks(self, selected: bool) -> None:
         for var in self._stack_vars.values():
-            var.set(value)
+            var.set(selected)
+
+    def _selected_stacks(self) -> list[DockerStack]:
+        if self._active is None:
+            return []
+        return [
+            stack
+            for stack in self._active.stacks
+            if (var := self._stack_vars.get(stack.path)) is not None and var.get()
+        ]
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Updates
+    # Updating the selected host
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _update_selected_stacks(self):
-        if not self._ssh or not self._active_host:
+    def _update_selected_stacks(self) -> None:
+        session = self._session()
+        if session is None:
             return
-        selected_paths = {path for path, var in self._stack_vars.items() if var.get()}
-        if not selected_paths:
-            messagebox.showinfo("Nothing selected", "Select at least one stack to update.", parent=self)
-            return
+        host, ssh = session
 
-        stacks_to_update = [s for s in self._active_host.stacks if s.path in selected_paths]
-        count = len(stacks_to_update)
+        stacks = self._selected_stacks()
+        if not stacks:
+            messagebox.showinfo(
+                "Nothing selected", "Select at least one stack to update.", parent=self
+            )
+            return
         if not messagebox.askyesno(
             "Confirm Update",
-            f"Update {count} stack(s) on '{self._active_host.display_name}'?\nThis will pull new images and recreate containers.",
+            f"Update {len(stacks)} stack(s) on '{host.display_name}'?\n\n"
+            f"Images will be pulled and containers recreated.",
             parent=self,
         ):
             return
 
         self._set_busy(True)
         self._btn_update_stacks.configure(state="disabled", text="Updating…")
-        self._log.log(f"Starting update of {count} stack(s)…")
-        ssh = self._ssh
+        self._log.log(f"Updating {len(stacks)} stack(s) on {host.display_name}…")
 
-        def task():
-            results = []
-            for stack in stacks_to_update:
-                ok = ssh.update_stack(
-                    stack,
-                    log_cb=lambda m: self.after(0, lambda msg=m: self._log.log(msg)),
-                )
-                results.append((stack.name, ok))
-            self.after(0, lambda: self._on_update_done(results))
+        def task() -> None:
+            results = [ssh.update_stack(stack, self._log.log) for stack in stacks]
+            self.after(0, lambda: self._on_stacks_updated(results))
 
-        threading.Thread(target=task, daemon=True).start()
+        _run_in_thread(task)
 
-    def _on_update_done(self, results: list[tuple[str, bool]]):
+    def _on_stacks_updated(self, results: list[bool]) -> None:
         self._set_busy(False)
-        self._btn_update_stacks.configure(state="normal", text="Update Selected Stacks")
-        passed = sum(1 for _, ok in results if ok)
-        failed = len(results) - passed
-        level = "success" if failed == 0 else "warn" if passed > 0 else "error"
-        self._log.log(f"Update complete: {passed} succeeded, {failed} failed.", level)
-        self._scan_stacks()
+        self._btn_update_stacks.configure(
+            text="Update Selected Stacks",
+            state="normal" if self._connected() else "disabled",
+        )
+        succeeded = sum(results)
+        failed = len(results) - succeeded
+        level = "success" if not failed else "warn" if succeeded else "error"
+        self._log.log(
+            f"Stack update finished: {succeeded} succeeded, {failed} failed.", level
+        )
+        if self._connected():
+            self._scan_stacks()  # Refresh the status column.
 
-    def _run_system_update(self):
-        if not self._ssh or not self._active_host:
+    def _run_system_update(self) -> None:
+        session = self._session()
+        if session is None:
             return
-        host = self._active_host
+        host, ssh = session
+        manager = self._package_manager(host)
         if not messagebox.askyesno(
             "System Update",
-            f"Run a full system package update on '{host.display_name}'?\nThis may take several minutes.",
+            f"Run a full system package update on '{host.display_name}' "
+            f"using {manager.name}?\n\nThis may take several minutes.",
             parent=self,
         ):
             return
 
         self._set_busy(True)
-        self._log.log("Starting system update…")
-        ssh = self._ssh
+        self._btn_sys_update.configure(state="disabled", text="Updating…")
 
-        def task():
-            ok = ssh.run_system_update(
-                host.os_info or "unknown",
-                log_cb=lambda m: self.after(0, lambda msg=m: self._log.log(msg)),
-            )
-            level = "success" if ok else "error"
-            self.after(0, lambda: self._log.log("System update finished.", level))
-            self.after(0, lambda: self._set_busy(False))
+        def task() -> None:
+            ok = ssh.run_system_update(manager, self._log.log)
+            self.after(0, lambda: self._on_system_updated(host, ok))
 
-        threading.Thread(target=task, daemon=True).start()
+        _run_in_thread(task)
+
+    def _on_system_updated(self, host: Host, ok: bool) -> None:
+        self._set_busy(False)
+        self._btn_sys_update.configure(
+            text="System Update", state="normal" if self._connected() else "disabled"
+        )
+        host.pending_updates = 0 if ok else UPDATES_FAILED
+        self._log.log(
+            f"{host.display_name}: system update "
+            f"{'completed' if ok else 'failed'}.",
+            "success" if ok else "error",
+        )
+        self._host_list.refresh()
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Bulk operations (all hosts)
+    # Bulk actions across every host
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _check_all_updates(self):
-        if not self._hosts:
-            return
-        self._btn_check_all.configure(state="disabled", text="Checking…")
-        self._btn_update_all.configure(state="disabled")
-        self._log.log(f"Checking for updates on {len(self._hosts)} host(s)…")
-        remaining = [len(self._hosts)]
-
-        def check_host(host: Host):
-            password = get_password(host.hostname, host.username) or ""
-            ssh = SSHClient(host.hostname, host.username, password, host.port, key_path=host.key_path)
-            ok, err = ssh.connect()
-            if ok:
-                if not host.os_info:
-                    os_id, pretty = ssh.detect_os()
-                    self.after(0, lambda h=host, oid=os_id, p=pretty: self._on_os_detected(h, oid, p))
-                count = ssh.check_updates(host.os_info or "unknown")
-                ssh.disconnect()
+    def _check_all_updates(self) -> None:
+        def worker(host: Host, ssh: SSHClient, log: Logger) -> None:
+            manager = self._package_manager(host)
+            count = ssh.check_updates(manager)
+            host.pending_updates = UPDATES_FAILED if count is None else count
+            if count is None:
+                log(f"could not read pending updates via {manager.name}", "warn")
+            elif count == 0:
+                log("up to date", "success")
             else:
-                count = -1
+                log(f"{count} update(s) available", "warn")
 
-            def update_ui():
-                host.pending_updates = count
-                remaining[0] -= 1
-                self._refresh_host_list()
-                if count < 0:
-                    self._log.log(f"{host.display_name}: could not connect — {err}", "warn")
-                elif count == 0:
-                    self._log.log(f"{host.display_name}: up to date", "info")
-                else:
-                    self._log.log(f"{host.display_name}: {count} update(s) available", "warn")
-                if remaining[0] == 0:
-                    self._btn_check_all.configure(state="normal", text="Check All Updates")
-                    self._btn_update_all.configure(state="normal")
-                    self._log.log("Update check complete.", "success")
+        self._for_each_host(
+            "Update check", worker, button=self._btn_check_all, busy_text="Checking…"
+        )
 
-            self.after(0, update_ui)
+    def _update_all_hosts(self) -> None:
+        def worker(host: Host, ssh: SSHClient, log: Logger) -> None:
+            ok = ssh.run_system_update(self._package_manager(host), log)
+            host.pending_updates = 0 if ok else UPDATES_FAILED
 
-        for host in self._hosts:
-            threading.Thread(target=check_host, args=(host,), daemon=True).start()
+        self._for_each_host(
+            "System update",
+            worker,
+            button=self._btn_update_all,
+            busy_text="Updating…",
+            confirm=(
+                f"Run a full system package update on all {len(self._hosts)} host(s)?"
+                f"\n\nThis may take several minutes per host."
+            ),
+        )
 
-    def _update_all_hosts(self):
-        if not self._hosts:
+    def _for_each_host(
+        self,
+        action: str,
+        worker: HostWorker,
+        *,
+        button: ctk.CTkButton,
+        busy_text: str,
+        confirm: Optional[str] = None,
+    ) -> None:
+        """Run ``worker(host, ssh, log)`` against every host, in parallel.
+
+        Everything the bulk actions share lives here: confirming, disabling the
+        buttons, connecting, one-time OS detection, prefixing log lines with the
+        host name, disconnecting, and restoring the UI once the last host
+        finishes. A worker only has to do the part that differs.
+        """
+        hosts = list(self._hosts)
+        if not hosts:
+            self._log.log("No hosts configured.", "warn")
             return
-        count = len(self._hosts)
-        if not messagebox.askyesno(
-            "Update All Hosts",
-            f"Run a full system update on all {count} host(s)?\nThis may take several minutes per host.",
-            parent=self,
-        ):
+        if confirm and not messagebox.askyesno(action, confirm, parent=self):
             return
 
-        self._btn_update_all.configure(state="disabled", text="Updating All…")
-        self._btn_check_all.configure(state="disabled")
-        self._log.log(f"Starting system update on {count} host(s)…")
-        remaining = [count]
+        self._set_bulk_enabled(False)
+        button.configure(text=busy_text)
+        self._log.log(f"{action}: starting on {len(hosts)} host(s)…")
 
-        def update_host(host: Host):
-            password = get_password(host.hostname, host.username) or ""
-            ssh = SSHClient(host.hostname, host.username, password, host.port, key_path=host.key_path)
+        remaining = len(hosts)
+        lock = threading.Lock()
 
-            def log(msg: str):
-                self.after(0, lambda m=msg: self._log.log(f"[{host.display_name}] {m}"))
+        def run_one(host: Host) -> None:
+            nonlocal remaining
 
-            ok, err = ssh.connect()
-            if not ok:
-                log(f"Connection failed: {err}")
-                success = False
-            else:
-                if not host.os_info:
-                    os_id, pretty = ssh.detect_os()
-                    self.after(0, lambda h=host, oid=os_id, p=pretty: self._on_os_detected(h, oid, p))
-                success = ssh.run_system_update(host.os_info or "unknown", log_cb=log)
-                if success:
-                    host.pending_updates = 0
-                ssh.disconnect()
+            def log(message: str, level: str = "info") -> None:
+                self._log.log(f"[{host.display_name}] {message}", level)
 
-            def done_ui():
-                remaining[0] -= 1
-                self._refresh_host_list()
-                if remaining[0] == 0:
-                    self._btn_update_all.configure(state="normal", text="Update All Hosts")
-                    self._btn_check_all.configure(state="normal")
-                    self._log.log("All host updates finished.", "success")
+            try:
+                with self._client_for(host) as ssh:
+                    ok, error = ssh.connect()
+                    if not ok:
+                        host.pending_updates = UPDATES_FAILED
+                        log(error, "error")
+                    else:
+                        self._ensure_os_info(host, ssh)
+                        worker(host, ssh, log)
+            except Exception as exc:  # A worker thread must not die silently.
+                host.pending_updates = UPDATES_FAILED
+                log(f"unexpected error: {exc}", "error")
+            finally:
+                with lock:
+                    remaining -= 1
+                    finished = remaining == 0
+                self.after(0, self._host_list.refresh)
+                if finished:
+                    self.after(0, lambda: self._finish_bulk(action))
 
-            self.after(0, done_ui)
+        pool = ThreadPoolExecutor(
+            max_workers=min(MAX_PARALLEL_HOSTS, len(hosts)),
+            thread_name_prefix="bulk-host",
+        )
+        for host in hosts:
+            pool.submit(run_one, host)
+        # Release the pool's threads as they drain; waiting here would block the
+        # UI thread for the whole run.
+        pool.shutdown(wait=False)
 
-        for host in self._hosts:
-            threading.Thread(target=update_host, args=(host,), daemon=True).start()
+    def _finish_bulk(self, action: str) -> None:
+        self._set_bulk_enabled(True)
+        save_hosts(self._hosts)
+        self._host_list.refresh()
+        self._log.log(f"{action}: finished on all hosts.", "success")
+
+    def _set_bulk_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        self._btn_check_all.configure(state=state, text="Check All Updates")
+        self._btn_update_all.configure(state=state, text="Update All Hosts")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _set_busy(self, busy: bool):
+    def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         self.configure(cursor="watch" if busy else "")
 
-    def _on_close(self):
-        self._disconnect_ssh()
-        save_hosts(self._hosts)
+    def _on_close(self) -> None:
+        self._disconnect()
+        try:
+            save_hosts(self._hosts)
+        except OSError:
+            pass  # Nothing useful to show; the window is already closing.
         self.destroy()
+
+
+def _read_hosts() -> tuple[list[Host], int]:
+    """Load hosts from disk, returning the valid ones and how many were skipped.
+
+    One malformed record should cost the user that record, not the application.
+    """
+    hosts: list[Host] = []
+    skipped = 0
+    for entry in load_hosts():
+        try:
+            hosts.append(Host.from_dict(entry))
+        except (KeyError, TypeError, ValueError):
+            skipped += 1
+    return hosts, skipped
+
+
+def _run_in_thread(task: Callable[[], None]) -> None:
+    threading.Thread(target=task, daemon=True).start()

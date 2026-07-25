@@ -1,3 +1,5 @@
+"""Modal dialog for adding or editing a host."""
+
 import os
 import customtkinter as ctk
 import tkinter as tk
@@ -5,15 +7,20 @@ from tkinter import filedialog, messagebox
 
 
 class HostDialog(ctk.CTkToplevel):
-    """Dialog for adding or editing a host."""
+    """Collects host connection details.
+
+    On save, :attr:`result` holds a dict of the entered values; it stays ``None``
+    if the user cancelled. The dialog never touches the keyring or the host
+    object itself — the caller decides what to do with the values.
+    """
 
     def __init__(self, parent, host=None):
         super().__init__(parent)
-        self.result = None
+        self.result: dict | None = None
         self._host = host
 
         self.title("Edit Host" if host else "Add Host")
-        self.geometry("440x500")
+        self.geometry("440x520")
         self.resizable(False, False)
         self.grab_set()
         self.lift()
@@ -23,6 +30,8 @@ class HostDialog(ctk.CTkToplevel):
         if host:
             self._populate(host)
 
+        self.bind("<Return>", lambda _event: self._save())
+        self.bind("<Escape>", lambda _event: self._cancel())
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
     def _build(self):
@@ -56,12 +65,13 @@ class HostDialog(ctk.CTkToplevel):
         ctk.CTkButton(key_row, text="Browse", width=70, command=self._browse_key).grid(row=0, column=1)
 
         # ── Password ─────────────────────────────────────────────────────────
-        self._pass_label = ctk.CTkLabel(self, text="Password (required without key)")
+        self._pass_label = ctk.CTkLabel(self, text=self._password_hint())
         self._pass_label.pack(anchor="w", **pad)
         self._pass = ctk.CTkEntry(self, show="*", placeholder_text="password")
         self._pass.pack(fill="x", **pad)
 
-        # Update label dynamically as key path changes
+        # Whether a password is required depends on whether a key is set, so the
+        # hint has to follow the key field as it is typed or browsed to.
         self._key_var.trace_add("write", self._on_key_changed)
 
         # ── Buttons ───────────────────────────────────────────────────────────
@@ -70,10 +80,16 @@ class HostDialog(ctk.CTkToplevel):
         ctk.CTkButton(btn_frame, text="Cancel", fg_color="gray40", command=self._cancel).pack(side="right", padx=4)
         ctk.CTkButton(btn_frame, text="Save", command=self._save).pack(side="right")
 
+    def _password_hint(self) -> str:
+        """Label for the password field, which means different things per mode."""
+        if self._host is not None:
+            return "Password (leave blank to keep the stored one)"
+        if self._key_var.get().strip():
+            return "Passphrase (optional — only if the key needs one)"
+        return "Password (required without a key)"
+
     def _on_key_changed(self, *_):
-        has_key = bool(self._key_var.get().strip())
-        label = "Password (optional — key provided)" if has_key else "Password (required without key)"
-        self._pass_label.configure(text=label)
+        self._pass_label.configure(text=self._password_hint())
 
     def _browse_key(self):
         start = os.path.expanduser("~/.ssh")

@@ -1,12 +1,95 @@
+"""SSH transport: connect to a host, inspect it, and run commands on it.
+
+This module is deliberately distro-agnostic — it knows how to *run* a command
+and hand its output back, while :mod:`core.distro` decides *which* commands to
+run. There are two execution paths:
+
+* :meth:`SSHClient.run` — one-shot command, fully buffered. For fast probes.
+* :meth:`SSHClient.stream` — long-running command whose output is delivered a
+  line at a time, so the GUI can show progress while ``apt`` or ``docker pull``
+  is still working.
+
+Both paths can escalate through ``sudo`` when the login user is not root, and
+both are safe to call from a worker thread — one :class:`SSHClient` per thread,
+never shared.
+"""
+
+import json
 import shlex
 import socket
 import time
-import paramiko
+from dataclasses import dataclass
 from typing import Callable, Optional
+
+import paramiko
+
+from core.credentials import KNOWN_HOSTS_FILE, config_dir
+from core.distro import OSInfo, PackageManager
 from models.host import DockerStack
+
+LineSink = Callable[[str], None]
+"""Receives one line of remote output at a time, without its trailing newline."""
+
+# Timeouts in seconds, sized to the slowest realistic case for each operation.
+CONNECT_TIMEOUT = 10
+PROBE_TIMEOUT = 15
+FIND_TIMEOUT = 120
+CHECK_UPDATES_TIMEOUT = 90
+PULL_TIMEOUT = 1800
+COMPOSE_UP_TIMEOUT = 600
+SYSTEM_UPDATE_TIMEOUT = 3600
+
+_POLL_INTERVAL = 0.2
+_CHUNK_BYTES = 32768
+
+_COMPOSE_FILENAMES = (
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+)
+
+#: Where compose projects normally live. Cheap to scan and covers the usual
+#: layouts without walking the whole filesystem.
+_SEARCH_ROOTS = ("/opt", "/srv", "/home", "/root", "/docker", "/stacks", "/data")
+
+#: Never descend into these — either enormous, meaningless, or Docker's own
+#: internal storage (which contains compose files belonging to no project).
+_PRUNE_NAMES = ("node_modules", ".git", ".cache", "vendor")
+_PRUNE_PATHS = ("/proc", "/sys", "/dev", "/run", "/snap", "/var/lib/docker")
+
+_MAX_STACKS = 250
+
+# One container per line: project name, project directory, container state.
+_PS_FORMAT = (
+    '{{.Label "com.docker.compose.project"}}\t'
+    '{{.Label "com.docker.compose.project.working_dir"}}\t'
+    "{{.State}}"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CommandResult:
+    """Outcome of a buffered remote command."""
+
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int = -1
+
+    @property
+    def ok(self) -> bool:
+        return self.exit_code == 0
 
 
 class SSHClient:
+    """A single SSH session to one host.
+
+    Probe results that cannot change within a session (which compose binary
+    exists, whether Docker needs ``sudo``, whether ``sudo`` needs a password)
+    are cached after the first lookup, so a stack scan costs one round trip per
+    fact rather than one per stack.
+    """
+
     def __init__(
         self,
         hostname: str,
@@ -20,285 +103,531 @@ class SSHClient:
         self.password = password
         self.port = port
         self.key_path = key_path
+
         self._client: Optional[paramiko.SSHClient] = None
-        self._compose_bin: str = ""
+        self._compose_cmd: Optional[str] = None
+        self._docker_sudo: Optional[bool] = None
+        self._sudo_needs_password: Optional[bool] = None
 
-    def connect(self, timeout: int = 10) -> tuple[bool, str]:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Connection lifecycle
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def connect(self, timeout: int = CONNECT_TIMEOUT) -> tuple[bool, str]:
+        """Open the session. Returns ``(ok, message)`` — never raises."""
+        client = paramiko.SSHClient()
+        self._load_host_keys(client)
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        kwargs: dict = {
+            "hostname": self.hostname,
+            "port": self.port,
+            "username": self.username,
+            "timeout": timeout,
+            "auth_timeout": timeout,
+            "banner_timeout": timeout,
+        }
+        if self.key_path:
+            kwargs["key_filename"] = self.key_path
+            kwargs["look_for_keys"] = False
+            kwargs["allow_agent"] = False
+            if self.password:
+                # With a key configured, the stored secret is its passphrase.
+                kwargs["passphrase"] = self.password
+        elif self.password:
+            kwargs["password"] = self.password
+            kwargs["look_for_keys"] = False
+            kwargs["allow_agent"] = False
+        else:
+            # Nothing configured — fall back to the agent and ~/.ssh defaults.
+            kwargs["look_for_keys"] = True
+            kwargs["allow_agent"] = True
+
         try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-            connect_kwargs: dict = dict(
-                hostname=self.hostname,
-                port=self.port,
-                username=self.username,
-                timeout=timeout,
-                look_for_keys=False,
-                allow_agent=False,
+            client.connect(**kwargs)
+        except paramiko.BadHostKeyException as exc:
+            return False, (
+                f"Host key for {self.hostname} has changed since it was first "
+                f"accepted (now {exc.key.get_base64()[:16]}…). This can mean the "
+                f"server was rebuilt — or that the connection is being "
+                f"intercepted. Remove the stale entry from "
+                f"{KNOWN_HOSTS_FILE} to accept the new key."
             )
-
-            if self.key_path:
-                connect_kwargs["key_filename"] = self.key_path
-                if self.password:
-                    connect_kwargs["passphrase"] = self.password
-            else:
-                connect_kwargs["password"] = self.password
-
-            client.connect(**connect_kwargs)
-            self._client = client
-            return True, "Connected"
         except paramiko.AuthenticationException:
-            hint = "check key file / passphrase" if self.key_path else "check username/password"
+            hint = (
+                "check the key file and its passphrase"
+                if self.key_path
+                else "check the username and password"
+            )
             return False, f"Authentication failed — {hint}"
         except paramiko.NoValidConnectionsError:
-            return False, f"Cannot connect to {self.hostname}:{self.port}"
+            return False, f"Cannot reach {self.hostname}:{self.port}"
         except socket.timeout:
             return False, f"Connection timed out after {timeout}s"
-        except Exception as e:
-            return False, str(e)
+        except (paramiko.SSHException, OSError) as exc:
+            return False, str(exc) or exc.__class__.__name__
 
-    def disconnect(self):
-        if self._client:
+        self._client = client
+        return True, "Connected"
+
+    def disconnect(self) -> None:
+        """Close the session. Safe to call more than once."""
+        if self._client is not None:
             self._client.close()
             self._client = None
 
-    def run(self, command: str, timeout: int = 30) -> tuple[str, str, int]:
-        if not self._client:
-            return "", "Not connected", -1
+    @property
+    def is_connected(self) -> bool:
+        if self._client is None:
+            return False
+        transport = self._client.get_transport()
+        return transport is not None and transport.is_active()
+
+    def __enter__(self) -> "SSHClient":
+        return self
+
+    def __exit__(self, *_exc_info) -> None:
+        self.disconnect()
+
+    @staticmethod
+    def _load_host_keys(client: paramiko.SSHClient) -> None:
+        """Trust ``~/.ssh/known_hosts`` plus this app's own accepted-keys file.
+
+        Loading a file (rather than only auto-adding in memory) is what lets
+        paramiko save newly accepted keys and, crucially, raise
+        :class:`~paramiko.BadHostKeyException` later if a host's key *changes*.
+        """
         try:
-            stdin, stdout, stderr = self._client.exec_command(command, timeout=timeout)
+            client.load_system_host_keys()
+        except (OSError, paramiko.SSHException):
+            pass
+        try:
+            config_dir()
+            KNOWN_HOSTS_FILE.touch(exist_ok=True)
+            client.load_host_keys(str(KNOWN_HOSTS_FILE))
+        except (OSError, paramiko.SSHException):
+            pass
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Command execution
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def run(self, command: str, timeout: int = PROBE_TIMEOUT) -> CommandResult:
+        """Run ``command`` and return its buffered output. Never raises."""
+        if self._client is None:
+            return CommandResult(stderr="Not connected")
+        try:
+            _stdin, stdout, stderr = self._client.exec_command(command, timeout=timeout)
             exit_code = stdout.channel.recv_exit_status()
-            out = stdout.read().decode("utf-8", errors="replace").strip()
-            err = stderr.read().decode("utf-8", errors="replace").strip()
-            return out, err, exit_code
-        except Exception as e:
-            return "", str(e), -1
+            return CommandResult(
+                stdout=stdout.read().decode("utf-8", "replace").strip(),
+                stderr=stderr.read().decode("utf-8", "replace").strip(),
+                exit_code=exit_code,
+            )
+        except (paramiko.SSHException, socket.error, EOFError) as exc:
+            return CommandResult(stderr=str(exc) or exc.__class__.__name__)
 
-    def detect_os(self) -> tuple[str, str]:
-        out, _, code = self.run("cat /etc/os-release 2>/dev/null || uname -a")
-        if code != 0 or not out:
-            return "linux", "Linux (unknown)"
+    def stream(
+        self,
+        command: str,
+        on_line: LineSink,
+        timeout: int = SYSTEM_UPDATE_TIMEOUT,
+        sudo: bool = False,
+    ) -> int:
+        """Run ``command``, reporting output to ``on_line`` as it arrives.
 
-        fields = {}
-        for line in out.splitlines():
-            if "=" in line:
-                k, _, v = line.partition("=")
-                fields[k.strip()] = v.strip().strip('"')
+        Returns the remote exit status, or ``-1`` if the command could not be
+        started, timed out, or the connection failed mid-run.
 
-        os_id = fields.get("ID", "linux")
-        pretty = fields.get("PRETTY_NAME", fields.get("NAME", ""))
+        Output is read with a short socket timeout rather than a busy-poll, so
+        an idle command costs nothing while a chatty one is still forwarded
+        promptly. stdout and stderr are interleaved into one stream, which is
+        what makes the log read like a terminal session.
+        """
+        if self._client is None:
+            on_line("Not connected.")
+            return -1
 
-        if not pretty or "uname" in out.lower():
-            uname, _, _ = self.run("uname -sr")
-            pretty = uname or "Linux"
+        prefix, feed_password = self._sudo_prefix() if sudo else ("", False)
+        wrapped = f"{prefix}bash -c {shlex.quote(command)}"
 
-        return os_id, pretty
+        try:
+            stdin, stdout, _stderr = self._client.exec_command(wrapped, timeout=timeout)
+        except (paramiko.SSHException, socket.error) as exc:
+            on_line(f"Could not start command: {exc}")
+            return -1
 
-    def find_docker_stacks(self, log_cb: Callable[[str], None] | None = None) -> list[DockerStack]:
-        if log_cb:
-            log_cb("Scanning for docker compose files...")
+        channel = stdout.channel
+        try:
+            if feed_password:
+                stdin.write(f"{self.password}\n")
+                stdin.flush()
+            channel.shutdown_write()
+        except (paramiko.SSHException, socket.error, OSError):
+            pass  # The remote may have exited before reading stdin.
 
-        search_cmd = (
-            "find /opt /home /srv /root /var/lib/docker /docker /stack /compose "
-            r"-maxdepth 6 \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' "
-            r"-o -name 'compose.yml' -o -name 'compose.yaml' \) 2>/dev/null | sort"
-        )
-        out, _, _ = self.run(search_cmd, timeout=60)
+        return self._pump(channel, on_line, timeout)
 
-        if not out:
-            out, _, _ = self.run(
-                r"find / -maxdepth 8 \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' "
-                r"-o -name 'compose.yml' -o -name 'compose.yaml' \) 2>/dev/null | head -100 | sort",
-                timeout=90,
+    @staticmethod
+    def _pump(channel: paramiko.Channel, on_line: LineSink, timeout: int) -> int:
+        """Forward everything ``channel`` produces to ``on_line``, then reap it."""
+        channel.settimeout(_POLL_INTERVAL)
+        partial = {"out": b"", "err": b""}
+
+        def emit(stream: str, data: bytes) -> None:
+            *lines, partial[stream] = (partial[stream] + data).split(b"\n")
+            for raw in lines:
+                text = raw.decode("utf-8", "replace").rstrip()
+                # Suppress sudo's own prompt; the password went in via stdin.
+                if text and not text.startswith("[sudo]"):
+                    on_line(text)
+
+        deadline = time.monotonic() + timeout
+        stdout_open = True
+        try:
+            while True:
+                if time.monotonic() > deadline:
+                    on_line(f"Timed out after {timeout}s — aborting.")
+                    channel.close()
+                    return -1
+
+                if stdout_open:
+                    try:
+                        chunk = channel.recv(_CHUNK_BYTES)
+                        if chunk:
+                            emit("out", chunk)
+                        else:
+                            stdout_open = False
+                    except socket.timeout:
+                        pass
+
+                while channel.recv_stderr_ready():
+                    emit("err", channel.recv_stderr(_CHUNK_BYTES))
+
+                if not stdout_open:
+                    if channel.exit_status_ready():
+                        break
+                    time.sleep(_POLL_INTERVAL)
+
+            # Flush anything left without a trailing newline.
+            emit("out", b"\n")
+            emit("err", b"\n")
+            return channel.recv_exit_status()
+        except (paramiko.SSHException, socket.error, EOFError) as exc:
+            on_line(f"Connection lost while running command: {exc}")
+            return -1
+
+    def _sudo_prefix(self) -> tuple[str, bool]:
+        """Return ``(command_prefix, must_feed_password)`` for privileged work.
+
+        Passwordless ``sudo`` is probed once per session: when it is configured,
+        the stored password is never sent over the wire at all.
+        """
+        if self.username == "root":
+            return "", False
+        if self._sudo_needs_password is None:
+            self._sudo_needs_password = not self.run("sudo -n true", timeout=10).ok
+        if not self._sudo_needs_password:
+            return "sudo -n ", False
+        return "sudo -S -p '' ", True
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Host inspection
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def detect_os(self) -> OSInfo:
+        """Identify the remote distribution from ``/etc/os-release``."""
+        result = self.run("cat /etc/os-release")
+        if result.ok and result.stdout:
+            fields = self._parse_os_release(result.stdout)
+            pretty = fields.get("PRETTY_NAME") or fields.get("NAME", "")
+            if pretty:
+                return OSInfo(
+                    id=fields.get("ID", ""),
+                    pretty=pretty,
+                    like=fields.get("ID_LIKE", ""),
+                )
+
+        # No os-release (Alpine before 3.x, minimal images, BSDs): fall back to
+        # something recognisable so the host is still usable.
+        uname = self.run("uname -sr").stdout
+        return OSInfo(pretty=uname or "Unknown OS")
+
+    @staticmethod
+    def _parse_os_release(text: str) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for line in text.splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                fields[key.strip()] = value.strip().strip("\"'")
+        return fields
+
+    def check_updates(self, manager: PackageManager) -> Optional[int]:
+        """Count pending package updates. ``None`` when the count is unavailable.
+
+        Reflects the package lists already on the host; it does not refresh
+        them, since doing so requires root. Run a system update to resynchronise.
+        """
+        result = self.run(manager.check_cmd, timeout=CHECK_UPDATES_TIMEOUT)
+        lines = result.stdout.splitlines()
+        try:
+            return max(0, int(lines[-1].strip()))
+        except (ValueError, IndexError):
+            return None
+
+    def run_system_update(self, manager: PackageManager, on_line: LineSink) -> bool:
+        """Apply all pending OS package updates. Returns True on success."""
+        on_line(f"── System update via {manager.name} ──")
+        if self.username != "root" and self.key_path and not self.password:
+            on_line(
+                "Note: this host authenticates with a key, so no sudo password "
+                "is available. The update needs root — configure passwordless "
+                "sudo, or log in as root."
             )
 
-        stacks: list[DockerStack] = []
-        seen_paths: set[str] = set()
-
-        for compose_file in out.splitlines():
-            compose_file = compose_file.strip()
-            if not compose_file:
-                continue
-            folder = compose_file.rsplit("/", 1)[0]
-            if folder in seen_paths:
-                continue
-            seen_paths.add(folder)
-            name = folder.rsplit("/", 1)[-1]
-            stacks.append(DockerStack(name=name, path=folder, compose_file=compose_file))
-
-        if log_cb:
-            log_cb(f"Found {len(stacks)} stack(s)")
-
-        self._populate_stack_status(stacks)
-        return stacks
-
-    def _populate_stack_status(self, stacks: list[DockerStack]):
-        ps_out, _, code = self.run(
-            "docker ps --format '{{.Label \"com.docker.compose.project\"}}|{{.State}}' 2>/dev/null",
-            timeout=15,
+        exit_code = self.stream(
+            manager.update_cmd,
+            on_line,
+            timeout=SYSTEM_UPDATE_TIMEOUT,
+            sudo=True,
         )
-        running_projects: dict[str, set[str]] = {}
-        if code == 0:
-            for line in ps_out.splitlines():
-                if "|" in line:
-                    proj, state = line.split("|", 1)
-                    proj = proj.strip()
-                    if proj:
-                        running_projects.setdefault(proj, set()).add(state.strip())
+        if exit_code == 0:
+            on_line("System update completed.")
+            return True
+        on_line(f"System update failed (exit {exit_code}).")
+        return False
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Docker discovery
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def find_docker_stacks(self, on_line: Optional[LineSink] = None) -> list[DockerStack]:
+        """Discover Compose projects on the host.
+
+        Two complementary sources, because neither alone is complete:
+
+        * ``docker compose ls`` knows every project Docker has ever created,
+          including its real project name — but not projects that were never
+          started.
+        * A filesystem scan finds compose files that have never been brought
+          up — but has to guess the project name from the folder.
+
+        Results are merged by directory, preferring Docker's own naming.
+        """
+        log = on_line or (lambda _msg: None)
+
+        stacks: dict[str, DockerStack] = {}
+        for project, compose_file in self._projects_known_to_docker():
+            folder = _parent_dir(compose_file)
+            if folder:
+                stacks[folder] = DockerStack(
+                    name=project or _basename(folder),
+                    path=folder,
+                    compose_file=compose_file,
+                    project=project,
+                )
+        if stacks:
+            log(f"Docker reports {len(stacks)} known project(s).")
+
+        log("Scanning the filesystem for compose files…")
+        for compose_file in self._find_compose_files(log):
+            folder = _parent_dir(compose_file)
+            if folder and folder not in stacks:
+                stacks[folder] = DockerStack(
+                    name=_basename(folder),
+                    path=folder,
+                    compose_file=compose_file,
+                )
+
+        found = [stacks[key] for key in sorted(stacks)]
+        self._apply_stack_status(found)
+        return found
+
+    def _projects_known_to_docker(self) -> list[tuple[str, str]]:
+        """Return ``(project_name, compose_file)`` from ``docker compose ls``."""
+        compose = self._compose_command()
+        if not compose:
+            return []
+        result = self.run(f"{self._sudo_n_prefix()}{compose} ls --all --format json")
+        if not result.ok or not result.stdout:
+            return []
+        try:
+            entries = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(entries, list):
+            return []
+
+        projects: list[tuple[str, str]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            # ConfigFiles is comma-separated when a project uses overrides;
+            # the first entry is the base compose file.
+            config = str(entry.get("ConfigFiles", "")).split(",")[0].strip()
+            if config:
+                projects.append((str(entry.get("Name", "")).strip(), config))
+        return projects
+
+    def _find_compose_files(self, log: LineSink) -> list[str]:
+        """Scan the usual locations, widening to the whole tree only if empty."""
+        result = self.run(self._find_command(_SEARCH_ROOTS, 6), timeout=FIND_TIMEOUT)
+        paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if paths:
+            return paths
+
+        log("Nothing in the usual locations — scanning from / (slower)…")
+        result = self.run(self._find_command(("/",), 7), timeout=FIND_TIMEOUT)
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    def _find_command(roots: tuple[str, ...], max_depth: int) -> str:
+        """Build a single pruning ``find`` for the compose filenames.
+
+        Pruning matters: without it a scan wanders into ``node_modules`` and
+        Docker's own overlay storage, which is both slow and full of compose
+        files that belong to no project.
+        """
+        names = " -o ".join(f"-name {shlex.quote(n)}" for n in _COMPOSE_FILENAMES)
+        skip = " -o ".join(
+            [f"-name {shlex.quote(n)}" for n in _PRUNE_NAMES]
+            + [f"-path {shlex.quote(p)}" for p in _PRUNE_PATHS]
+        )
+        return (
+            f"find {' '.join(roots)} -maxdepth {max_depth} "
+            rf"\( -type d \( {skip} \) -prune \) -o "
+            rf"-type f \( {names} \) -print 2>/dev/null "
+            f"| head -n {_MAX_STACKS} | sort -u"
+        )
+
+    def _apply_stack_status(self, stacks: list[DockerStack]) -> None:
+        """Fill in each stack's ``status`` from the host's container list.
+
+        Containers are matched on the Compose project directory as well as the
+        project name, because a project renamed with ``-p`` or
+        ``COMPOSE_PROJECT_NAME`` no longer matches its folder.
+        """
+        if not stacks:
+            return
+        result = self.run(
+            f"{self._sudo_n_prefix()}docker ps --all --format {shlex.quote(_PS_FORMAT)}"
+        )
+        if not result.ok:
+            return
+
+        states_by_project: dict[str, list[str]] = {}
+        states_by_dir: dict[str, list[str]] = {}
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            project, working_dir, state = (p.strip() for p in parts)
+            if project:
+                states_by_project.setdefault(project, []).append(state)
+            if working_dir:
+                states_by_dir.setdefault(working_dir.rstrip("/"), []).append(state)
 
         for stack in stacks:
-            project_states = running_projects.get(stack.name)
-            if project_states is None:
+            states = states_by_dir.get(stack.path.rstrip("/")) or states_by_project.get(
+                stack.project or stack.name
+            )
+            if not states:
                 stack.status = "stopped"
-            elif all(s == "running" for s in project_states):
+            elif all(state == "running" for state in states):
                 stack.status = "running"
-            else:
+            elif any(state == "running" for state in states):
                 stack.status = "partial"
+            else:
+                stack.status = "stopped"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Docker operations
+    # ──────────────────────────────────────────────────────────────────────────
 
     def update_stack(
         self,
         stack: DockerStack,
-        log_cb: Callable[[str], None],
+        on_line: LineSink,
         pull: bool = True,
     ) -> bool:
-        compose_bin = self._get_compose_bin()
-        log_cb(f"\n--- Updating {stack.name} ({stack.path}) ---")
+        """Pull the stack's images and recreate its containers.
+
+        A failed pull aborts before ``up``, leaving the running stack alone —
+        recreating containers against half-fetched images is how a routine
+        update turns into an outage.
+        """
+        compose = self._compose_command()
+        if not compose:
+            on_line("Neither 'docker compose' nor 'docker-compose' is available.")
+            return False
+
+        on_line(f"── {stack.name} ({stack.path}) ──")
+        needs_sudo = self._docker_needs_sudo()
+        in_dir = f"cd {shlex.quote(stack.path)} && {compose}"
 
         if pull:
-            log_cb("Pulling latest images...")
-            out, _, pull_code = self.run(
-                f"cd {stack.path} && {compose_bin} pull 2>&1",
-                timeout=300,
+            on_line("Pulling latest images…")
+            exit_code = self.stream(
+                f"{in_dir} pull", on_line, timeout=PULL_TIMEOUT, sudo=needs_sudo
             )
-            for line in out.splitlines():
-                log_cb(line)
-            if pull_code != 0:
-                log_cb(f"Pull failed (exit {pull_code}) — skipping up.")
+            if exit_code != 0:
+                on_line(
+                    f"Pull failed (exit {exit_code}) — '{stack.name}' left running "
+                    f"on its current images."
+                )
                 return False
 
-        log_cb("Bringing stack up...")
-        out, _, up_code = self.run(
-            f"cd {stack.path} && {compose_bin} up -d 2>&1",
-            timeout=120,
+        on_line("Recreating containers…")
+        exit_code = self.stream(
+            f"{in_dir} up -d", on_line, timeout=COMPOSE_UP_TIMEOUT, sudo=needs_sudo
         )
-        for line in out.splitlines():
-            log_cb(line)
-
-        if up_code == 0:
-            log_cb(f"Stack '{stack.name}' updated successfully.")
+        if exit_code == 0:
+            on_line(f"'{stack.name}' updated.")
             return True
-        log_cb(f"Stack '{stack.name}' update failed (exit {up_code}).")
+        on_line(f"'{stack.name}' failed to start (exit {exit_code}).")
         return False
 
-    def check_updates(self, os_id: str) -> int:
-        """Return count of pending package updates, or -1 on error."""
-        if os_id in ("ubuntu", "debian", "raspbian", "linuxmint", "pop"):
-            cmd = "apt list --upgradable 2>/dev/null | grep -c '\\[upgradable'"
-        elif os_id in ("fedora", "centos", "rhel", "rocky", "almalinux"):
-            cmd = "dnf list updates -q 2>/dev/null | tail -n +2 | wc -l"
-        elif os_id in ("arch", "manjaro", "endeavouros"):
-            cmd = "pacman -Qu 2>/dev/null | wc -l"
-        elif os_id == "alpine":
-            cmd = "apk list --upgrades 2>/dev/null | grep -c 'upgradable'"
-        elif os_id in ("opensuse", "suse", "opensuse-leap", "opensuse-tumbleweed"):
-            cmd = "zypper --non-interactive list-updates 2>/dev/null | grep -c '^v '"
-        else:
-            cmd = "apt list --upgradable 2>/dev/null | grep -c '\\[upgradable'"
-        out, _, _ = self.run(cmd, timeout=30)
-        try:
-            return int(out.strip())
-        except ValueError:
-            return -1
-
-    def run_system_update(self, os_id: str, log_cb: Callable[[str], None]) -> bool:
-        log_cb("\n--- Running system update ---")
-        if os_id in ("ubuntu", "debian", "raspbian", "linuxmint", "pop"):
-            cmd = "DEBIAN_FRONTEND=noninteractive apt-get update -y && apt-get upgrade -y"
-        elif os_id in ("fedora", "centos", "rhel", "rocky", "almalinux"):
-            cmd = "dnf upgrade -y || yum upgrade -y"
-        elif os_id in ("arch", "manjaro", "endeavouros"):
-            cmd = "pacman -Syu --noconfirm"
-        elif os_id == "alpine":
-            cmd = "apk update && apk upgrade"
-        elif os_id in ("opensuse", "suse", "opensuse-leap", "opensuse-tumbleweed"):
-            cmd = "zypper refresh && zypper update -y"
-        else:
-            log_cb(f"Unknown OS '{os_id}' — attempting apt-get then dnf...")
-            cmd = "apt-get update -y && apt-get upgrade -y || dnf upgrade -y"
-
-        exit_code = self._run_sudo_streaming(cmd, log_cb, timeout=600)
-        success = exit_code == 0
-        log_cb("System update " + ("completed successfully." if success else f"failed (exit {exit_code})."))
-        return success
-
-    def _run_sudo_streaming(self, command: str, log_cb: Callable[[str], None], timeout: int = 600) -> int:
-        if not self._client:
-            return -1
-        try:
-            if self.username == "root":
-                wrapped = f"bash -c {shlex.quote(command)}"
+    def _compose_command(self) -> str:
+        """Return ``docker compose``, ``docker-compose``, or ``""`` if neither."""
+        if self._compose_cmd is None:
+            if self.run("docker compose version", timeout=PROBE_TIMEOUT).ok:
+                self._compose_cmd = "docker compose"
+            elif self.run("docker-compose --version", timeout=PROBE_TIMEOUT).ok:
+                self._compose_cmd = "docker-compose"
             else:
-                wrapped = f"sudo -S -p '' bash -c {shlex.quote(command)}"
+                self._compose_cmd = ""
+        return self._compose_cmd
 
-            stdin, stdout, stderr = self._client.exec_command(wrapped, timeout=timeout)
-            if self.username != "root":
-                stdin.write(self.password + "\n")
-                stdin.flush()
-            stdin.channel.shutdown_write()
+    def _docker_needs_sudo(self) -> bool:
+        """Whether Docker commands must be escalated for this login user.
 
-            stdout_buf = b""
-            stderr_buf = b""
+        Users outside the ``docker`` group cannot reach the daemon socket, so
+        probing once here is what lets the same code serve both setups.
+        """
+        if self._docker_sudo is None:
+            if self.username == "root":
+                self._docker_sudo = False
+            else:
+                self._docker_sudo = not self.run("docker info", timeout=PROBE_TIMEOUT).ok
+        return self._docker_sudo
 
-            while not stdout.channel.exit_status_ready():
-                if stdout.channel.recv_ready():
-                    chunk = stdout.channel.recv(4096)
-                    stdout_buf += chunk
-                    lines = stdout_buf.split(b"\n")
-                    stdout_buf = lines[-1]
-                    for line in lines[:-1]:
-                        text = line.decode("utf-8", errors="replace").rstrip()
-                        if text:
-                            log_cb(text)
-                if stdout.channel.recv_stderr_ready():
-                    chunk = stdout.channel.recv_stderr(4096)
-                    stderr_buf += chunk
-                    lines = stderr_buf.split(b"\n")
-                    stderr_buf = lines[-1]
-                    for line in lines[:-1]:
-                        text = line.decode("utf-8", errors="replace").rstrip()
-                        if text and not text.startswith("[sudo]"):
-                            log_cb(text)
-                time.sleep(0.05)
+    def _sudo_n_prefix(self) -> str:
+        """``sudo -n `` for read-only Docker probes, or ``""``.
 
-            tail = (
-                stdout_buf.decode("utf-8", errors="replace")
-                + stdout.read().decode("utf-8", errors="replace")
-                + stderr_buf.decode("utf-8", errors="replace")
-                + stderr.read().decode("utf-8", errors="replace")
-            )
-            for line in tail.splitlines():
-                if line.strip() and not line.startswith("[sudo]"):
-                    log_cb(line)
+        Probes run through the buffered :meth:`run` path, which has nowhere to
+        send a password — so they only escalate when it is free to do so.
+        """
+        if not self._docker_needs_sudo():
+            return ""
+        prefix, needs_password = self._sudo_prefix()
+        return "" if needs_password else prefix
 
-            return stdout.channel.recv_exit_status()
-        except Exception as e:
-            log_cb(f"Error: {e}")
-            return -1
 
-    def _get_compose_bin(self) -> str:
-        if self._compose_bin:
-            return self._compose_bin
-        out, _, code = self.run("docker compose version 2>/dev/null", timeout=5)
-        if code == 0:
-            self._compose_bin = "docker compose"
-        else:
-            _, _, code2 = self.run("which docker-compose 2>/dev/null", timeout=5)
-            self._compose_bin = "docker-compose" if code2 == 0 else "docker compose"
-        return self._compose_bin
+def _parent_dir(path: str) -> str:
+    """Directory portion of an absolute POSIX path (``os.path`` is local-flavoured)."""
+    folder = path.rsplit("/", 1)[0]
+    return folder or "/"
 
-    @property
-    def is_connected(self) -> bool:
-        if not self._client:
-            return False
-        transport = self._client.get_transport()
-        return transport is not None and transport.is_active()
+
+def _basename(path: str) -> str:
+    return path.rstrip("/").rsplit("/", 1)[-1]

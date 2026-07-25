@@ -26,9 +26,22 @@ from core.credentials import (
     save_password,
 )
 from core.ssh_client import SSHClient
+from gui.compose_editor import ComposeEditor
 from gui.host_dialog import HostDialog
 from gui.host_list import HostList, os_badge_color
 from gui.log_panel import LogPanel
+from gui.maintenance import MaintenanceWindow
+from gui.stack_window import StackWindow
+from gui.theme import (
+    ACCENT_BLUE,
+    ACCENT_BLUE_HOVER,
+    ACCENT_PURPLE,
+    ACCENT_PURPLE_HOVER,
+    ACCENT_TEAL,
+    ACCENT_TEAL_HOVER,
+    MUTED,
+    state_color,
+)
 from models.host import UPDATES_FAILED, UPDATES_UNKNOWN, DockerStack, Host
 
 MAX_PARALLEL_HOSTS = 8
@@ -38,18 +51,8 @@ One thread per host stops being an optimisation somewhere around a dozen hosts;
 past that it is just contention and a fan of simultaneous auth attempts.
 """
 
-#: Stack status -> (icon, colour).
-STACK_STATUS = {
-    "running": ("●", "#4CAF50"),
-    "partial": ("◑", "#FFA500"),
-    "stopped": ("○", "#888888"),
-    "unknown": ("?", "#AAAAAA"),
-}
-
-_ACCENT_PURPLE = "#7B5EA7"
-_ACCENT_PURPLE_HOVER = "#6A4D96"
-_ACCENT_BLUE = "#2B5278"
-_ACCENT_BLUE_HOVER = "#1E3D5C"
+#: Icon per stack status; the colour comes from :func:`gui.theme.state_color`.
+STACK_ICONS = {"running": "●", "partial": "◑", "stopped": "○", "unknown": "?"}
 
 Logger = Callable[..., None]
 HostWorker = Callable[[Host, SSHClient, Logger], None]
@@ -71,7 +74,11 @@ class App(ctk.CTk):
         self._active: Optional[Host] = None
         self._ssh: Optional[SSHClient] = None
         self._stack_vars: dict[str, tk.BooleanVar] = {}
+        self._windows: dict[str, ctk.CTkToplevel] = {}
         self._busy = False
+        self._connecting = False
+        self._connect_token = 0
+        """Incremented to abandon an in-flight connection attempt."""
 
         self._build_ui()
         self._host_list.set_hosts(self._hosts)
@@ -140,16 +147,16 @@ class App(ctk.CTk):
         self._btn_check_all = ctk.CTkButton(
             bulk,
             text="Check All Updates",
-            fg_color=_ACCENT_BLUE,
-            hover_color=_ACCENT_BLUE_HOVER,
+            fg_color=ACCENT_BLUE,
+            hover_color=ACCENT_BLUE_HOVER,
             command=self._check_all_updates,
         )
         self._btn_check_all.pack(fill="x", pady=(0, 4))
         self._btn_update_all = ctk.CTkButton(
             bulk,
             text="Update All Hosts",
-            fg_color=_ACCENT_PURPLE,
-            hover_color=_ACCENT_PURPLE_HOVER,
+            fg_color=ACCENT_PURPLE,
+            hover_color=ACCENT_PURPLE_HOVER,
             command=self._update_all_hosts,
         )
         self._btn_update_all.pack(fill="x")
@@ -195,12 +202,23 @@ class App(ctk.CTk):
             actions,
             text="System Update",
             width=120,
-            fg_color=_ACCENT_PURPLE,
-            hover_color=_ACCENT_PURPLE_HOVER,
+            fg_color=ACCENT_PURPLE,
+            hover_color=ACCENT_PURPLE_HOVER,
             command=self._run_system_update,
             state="disabled",
         )
         self._btn_sys_update.pack(side="left", padx=4)
+
+        self._btn_maintenance = ctk.CTkButton(
+            actions,
+            text="Cleanup",
+            width=94,
+            fg_color=ACCENT_TEAL,
+            hover_color=ACCENT_TEAL_HOVER,
+            command=self._open_maintenance,
+            state="disabled",
+        )
+        self._btn_maintenance.pack(side="left", padx=4)
 
     def _build_stack_panel(self, parent) -> None:
         panel = ctk.CTkFrame(parent)
@@ -352,9 +370,12 @@ class App(ctk.CTk):
     def _toggle_connect(self) -> None:
         if self._active is None:
             return
-        if self._connected():
+        if self._connecting:
+            self._cancel_connect()
+        elif self._connected():
+            name = self._active.display_name
             self._disconnect()
-            self._log.log(f"Disconnected from {self._active.display_name}.")
+            self._log.log(f"Disconnected from {name}.")
         else:
             self._connect()
 
@@ -373,23 +394,44 @@ class App(ctk.CTk):
             )
             return
 
-        self._set_busy(True)
-        self._btn_connect.configure(text="Connecting…", state="disabled")
+        # Deliberately not _set_busy(): a connection attempt must leave the rest
+        # of the window usable. Locking it and showing a wait cursor is what made
+        # an unreachable host look like the application had hung.
+        self._connect_token += 1
+        token = self._connect_token
+        self._connecting = True
+        self._btn_connect.configure(text="Cancel", state="normal")
         self._log.log(f"Connecting to {host.display_name} ({host.address})…")
         if host.key_path:
             self._log.log(f"Using key {host.key_path}")
 
         def task() -> None:
             ok, message = ssh.connect()
-            self.after(0, lambda: self._on_connected(host, ssh, ok, message))
+            self.after(0, lambda: self._on_connected(token, host, ssh, ok, message))
 
         _run_in_thread(task)
 
-    def _on_connected(self, host: Host, ssh: SSHClient, ok: bool, message: str) -> None:
-        self._set_busy(False)
-        if host is not self._active:
-            ssh.disconnect()  # Selection moved on while we were connecting.
+    def _cancel_connect(self) -> None:
+        """Abandon the in-flight attempt.
+
+        The worker thread cannot be interrupted, but it is now bounded by the
+        reachability probe and will exit on its own; invalidating the token means
+        its result is ignored and the session it may open is closed.
+        """
+        self._connect_token += 1
+        self._connecting = False
+        self._log.log("Connection attempt abandoned.", "warn")
+        self._btn_connect.configure(text="Connect", state="normal")
+
+    def _on_connected(
+        self, token: int, host: Host, ssh: SSHClient, ok: bool, message: str
+    ) -> None:
+        if token != self._connect_token or host is not self._active:
+            # Cancelled, or the selection moved on while we were connecting.
+            _run_in_thread(ssh.disconnect)
             return
+
+        self._connecting = False
         if not ok:
             self._log.log(f"Connection failed: {message}", "error")
             self._btn_connect.configure(text="Connect", state="normal")
@@ -400,17 +442,25 @@ class App(ctk.CTk):
         self._btn_connect.configure(text="Disconnect", state="normal")
         self._btn_scan.configure(state="normal")
         self._btn_sys_update.configure(state="normal")
+        self._btn_maintenance.configure(state="normal")
         if host.stacks:
             self._btn_update_stacks.configure(state="normal")
         _run_in_thread(lambda: self._ensure_os_info(host, ssh))
 
     def _disconnect(self) -> None:
+        # Invalidate any attempt still in flight so its result cannot revive a
+        # session the user has already moved away from.
+        self._connect_token += 1
+        self._connecting = False
+        # Secondary windows hold this session; they are useless once it closes.
+        self._close_windows()
         if self._ssh is not None:
             self._ssh.disconnect()
             self._ssh = None
         self._btn_connect.configure(text="Connect", state="normal")
         self._btn_scan.configure(text="Scan Stacks", state="disabled")
         self._btn_sys_update.configure(state="disabled")
+        self._btn_maintenance.configure(state="disabled")
         self._btn_update_stacks.configure(state="disabled")
 
     def _session(self) -> Optional[tuple[Host, SSHClient]]:
@@ -542,21 +592,119 @@ class App(ctk.CTk):
             info,
             text=stack.path,
             font=ctk.CTkFont(size=11),
-            text_color="gray60",
+            text_color=MUTED,
             anchor="w",
         ).pack(fill="x")
 
-        icon, color = STACK_STATUS.get(stack.status, STACK_STATUS["unknown"])
         ctk.CTkLabel(
             row,
-            text=f"{icon} {stack.status}",
-            text_color=color,
+            text=f"{STACK_ICONS.get(stack.status, '?')} {stack.status}",
+            text_color=state_color(stack.status),
             font=ctk.CTkFont(size=12),
-        ).grid(row=0, column=2, padx=10)
+            width=86,
+            anchor="w",
+        ).grid(row=0, column=2, padx=(6, 2))
+
+        buttons = ctk.CTkFrame(row, fg_color="transparent")
+        buttons.grid(row=0, column=3, padx=(2, 8))
+        ctk.CTkButton(
+            buttons, text="Manage", width=68, height=26,
+            command=lambda s=stack: self._open_stack(s),
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            buttons, text="Edit", width=52, height=26,
+            fg_color=ACCENT_TEAL, hover_color=ACCENT_TEAL_HOVER,
+            command=lambda s=stack: self._edit_stack(s),
+        ).pack(side="left", padx=2)
 
     def _select_all_stacks(self, selected: bool) -> None:
         for var in self._stack_vars.values():
             var.set(selected)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Secondary windows
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _open_stack(self, stack: DockerStack) -> None:
+        """Open (or re-focus) the control window for one stack."""
+        session = self._session()
+        if session is None:
+            self._require_connection()
+            return
+        _host, ssh = session
+        self._open_window(
+            f"stack:{stack.path}",
+            lambda: StackWindow(
+                self,
+                ssh,
+                stack,
+                on_changed=self._refresh_stack_status,
+                on_edit=self._edit_stack,
+            ),
+        )
+
+    def _edit_stack(self, stack: DockerStack) -> None:
+        """Open (or re-focus) the compose editor for one stack."""
+        session = self._session()
+        if session is None:
+            self._require_connection()
+            return
+        _host, ssh = session
+        self._open_window(
+            f"editor:{stack.compose_file}",
+            lambda: ComposeEditor(
+                self,
+                ssh,
+                stack,
+                self._log.log,
+                on_deployed=self._refresh_stack_status,
+            ),
+        )
+
+    def _open_maintenance(self) -> None:
+        session = self._session()
+        if session is None:
+            self._require_connection()
+            return
+        host, ssh = session
+        self._open_window(
+            "maintenance",
+            lambda: MaintenanceWindow(self, ssh, host.display_name),
+        )
+
+    def _open_window(self, key: str, factory: Callable[[], ctk.CTkToplevel]) -> None:
+        """Show a secondary window, re-using the existing one if it is still open.
+
+        Without this, every click spawns another editor for the same file and two
+        of them can save over each other.
+        """
+        existing = self._windows.get(key)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        window = factory()
+        self._windows[key] = window
+
+    def _close_windows(self) -> None:
+        """Tear down secondary windows, e.g. when the session goes away."""
+        for window in list(self._windows.values()):
+            if window.winfo_exists():
+                window.destroy()
+        self._windows.clear()
+
+    def _require_connection(self) -> None:
+        messagebox.showinfo(
+            "Not connected",
+            "Connect to the host first.",
+            parent=self,
+        )
+
+    def _refresh_stack_status(self) -> None:
+        """Re-scan after a stack changed underneath us, if still connected."""
+        if self._connected() and not self._busy:
+            self._scan_stacks()
 
     def _selected_stacks(self) -> list[DockerStack]:
         if self._active is None:

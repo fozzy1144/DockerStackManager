@@ -1,3 +1,6 @@
 customtkinter>=5.2.0
 paramiko>=3.4.0
 keyring>=25.0.0
+# Optional: enables the compose editor's offline linting. Without it the editor
+# still works and relies on the host's `docker compose config` instead.
+PyYAML>=6.0

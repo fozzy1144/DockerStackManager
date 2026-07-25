@@ -37,6 +37,41 @@ class DockerStack:
         return _build(cls, data)
 
 
+@dataclass(frozen=True, slots=True)
+class Container:
+    """One container belonging to a stack, as ``docker compose ps`` reports it.
+
+    Runtime state only — never persisted.
+    """
+
+    name: str
+    service: str
+    state: str = ""
+    """``running``, ``exited``, ``created``, ``paused``, ``restarting``…"""
+
+    health: str = ""
+    """``healthy``, ``unhealthy``, ``starting``, or empty when no healthcheck."""
+
+    image: str = ""
+    ports: str = ""
+    """Published ports, pre-formatted for display."""
+
+    exit_code: int = 0
+
+    @property
+    def is_running(self) -> bool:
+        return self.state == "running"
+
+    @property
+    def status_label(self) -> str:
+        """State with health folded in, e.g. ``running (unhealthy)``."""
+        if self.health and self.state == "running":
+            return f"{self.state} ({self.health})"
+        if self.state == "exited" and self.exit_code:
+            return f"exited ({self.exit_code})"
+        return self.state or "unknown"
+
+
 @dataclass(slots=True)
 class Host:
     """A remote Linux host, plus whatever we have learned about it so far.

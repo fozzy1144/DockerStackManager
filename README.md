@@ -2,7 +2,7 @@
 
 A desktop GUI for managing and updating Linux hosts and Docker Compose stacks over SSH.
 
-![Python](https://img.shields.io/badge/python-3.12+-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green)
+![Python](https://img.shields.io/badge/python-3.12+-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green) [![tests](https://github.com/fozzy1144/DockerStackManager/actions/workflows/tests.yml/badge.svg)](https://github.com/fozzy1144/DockerStackManager/actions/workflows/tests.yml)
 
 ---
 
@@ -50,6 +50,13 @@ The compose editor: YAML highlighting, the documented example library on the lef
 git clone https://github.com/fozzy1144/DockerStackManager.git
 cd DockerStackManager
 pip install -r requirements.txt
+```
+
+Or install it as a package, which also puts a `docker-stack-manager` launcher on
+your PATH:
+
+```bash
+pip install .
 ```
 
 ## Running
@@ -208,6 +215,8 @@ DockerStackManager/
 ├── main.py                  # Entry point
 ├── run.bat                  # Windows launcher
 ├── requirements.txt
+├── pyproject.toml           # Package metadata and dependency bounds
+├── docker-stack-manager.spec  # PyInstaller build for the Windows executable
 ├── models/
 │   └── host.py              # Host, DockerStack, Container
 ├── core/
@@ -233,11 +242,37 @@ DockerStackManager/
 └── tests/                   # stdlib unittest; no dependencies required
 ```
 
-Run the tests with:
+Run the tests with either runner:
 
 ```bash
+python -m pytest
 python -m unittest discover -s tests -t .
 ```
+
+They need no host, no display, and no network. Three of them are guards on
+things that drift silently rather than on behaviour:
+`tests/test_gen_compose_docs.py` fails if `docs/compose-reference.md` no longer
+matches the snippet library, and `tests/test_packaging.py` fails if
+`requirements.txt` and `pyproject.toml` disagree or the PyInstaller spec loses a
+hidden import it needs.
+
+[GitHub Actions](.github/workflows/tests.yml) runs the suite on Windows against
+Python 3.12 and 3.13, re-runs the compose tests with PyYAML *uninstalled* to
+keep the degraded path honest, imports every GUI module, and freezes the
+executable.
+
+## Building a Windows executable
+
+```bash
+pip install -e ".[dev]"
+pyinstaller docker-stack-manager.spec
+```
+
+The result is a single `dist/DockerStackManager.exe` that needs no Python on the
+target machine. Two things in the spec are not automatic: CustomTkinter's themes
+have to be collected as data files, and keyring's Windows backend has to be
+named as a hidden import because it is found through entry points. CI builds
+this on every run and attaches the executable as an artifact.
 
 Four conventions hold the layers apart and are worth preserving:
 

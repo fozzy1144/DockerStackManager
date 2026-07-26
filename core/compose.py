@@ -580,20 +580,32 @@ def _service_names_by_regex(text: str) -> list[str]:
     """Best-effort service names when the document will not parse.
 
     The editor still wants to offer a service filter while the file is mid-edit
-    and temporarily invalid.
+    and temporarily invalid — and this is the only path there is when PyYAML is
+    not installed.
+
+    Only keys at the first indentation depth seen inside ``services:`` count.
+    Without that, a block opener one level down (``ports:``, ``healthcheck:``)
+    looks exactly like a service key and gets reported as one.
     """
     names: list[str] = []
     in_services = False
+    depth: Optional[int] = None
     for line in text.splitlines():
         if re.match(r"^services\s*:", line):
             in_services = True
             continue
-        if in_services:
-            if line.strip() and not line.startswith((" ", "\t", "#")):
-                break
-            match = re.match(r"^\s{1,4}([A-Za-z0-9._-]+)\s*:\s*$", line)
-            if match:
-                names.append(match.group(1))
+        if not in_services:
+            continue
+        if line.strip() and not line.startswith((" ", "\t", "#")):
+            break  # A new top-level key ends the block.
+        match = re.match(r"^(\s{1,4})([A-Za-z0-9._-]+)\s*:\s*(?:#.*)?$", line)
+        if match is None:
+            continue
+        indent = len(match.group(1))
+        if depth is None:
+            depth = indent
+        if indent == depth:
+            names.append(match.group(2))
     return names
 
 

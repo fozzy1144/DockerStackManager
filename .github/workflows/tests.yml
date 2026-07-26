@@ -1,0 +1,111 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to the same branch supersedes the run in progress.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Windows is the platform the app targets and the only one with the
+    # credential-manager backend the keyring code expects, so it is what CI
+    # runs. The test suite itself never opens a Tk root or a socket.
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      # PyYAML is optional at runtime: without it core.compose skips the
+      # structural lint rules and leans on the host's `docker compose config`.
+      # That path only has cover if something exercises it uninstalled.
+      - name: Run tests without the optional PyYAML dependency
+        run: |
+          pip uninstall -y PyYAML
+          python -m pytest -q tests/test_compose.py tests/test_snippets.py
+
+  import-check:
+    # The GUI modules are not imported by the test suite end to end. This is the
+    # cheapest way to catch a syntax error or a bad import in one of them.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Byte-compile every module
+        run: python -m compileall -q core gui models tools main.py
+
+      - name: Import the GUI modules
+        run: |
+          python -c "import gui.app, gui.compose_editor, gui.stack_window, gui.maintenance, gui.import_dialog, gui.host_dialog, gui.host_list, gui.log_panel, gui.code_editor, gui.theme"
+
+  build:
+    # The spec file's hidden imports and collected data cannot be checked by
+    # reading it — only a real freeze proves the executable has everything it
+    # needs. The artifact is a convenient side effect.
+    needs: [test, import-check]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the project and build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Freeze the executable
+        run: pyinstaller --noconfirm docker-stack-manager.spec
+
+      - name: Check the executable was produced
+        run: |
+          if (-not (Test-Path dist/DockerStackManager.exe)) { exit 1 }
+          "{0:N1} MB" -f ((Get-Item dist/DockerStackManager.exe).Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DockerStackManager-exe
+          path: dist/DockerStackManager.exe
+          if-no-files-found: error

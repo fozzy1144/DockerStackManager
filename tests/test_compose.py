@@ -1,8 +1,13 @@
 """Tests for compose parsing, linting, and diffing."""
 
 import unittest
+from unittest import mock
 
 from core import compose
+
+
+#: PyYAML is optional at runtime, so the structural rules are optional too.
+needs_yaml = unittest.skipUnless(compose.YAML_AVAILABLE, "PyYAML not installed")
 
 
 def _messages(findings):
@@ -34,6 +39,7 @@ networks:
 """
 
 
+@needs_yaml
 class TestParse(unittest.TestCase):
     def test_valid_document(self):
         result = compose.parse(VALID)
@@ -58,12 +64,14 @@ class TestParse(unittest.TestCase):
         self.assertIn("mapping", result.error.message)
 
 
+@needs_yaml
 class TestLintCleanFile(unittest.TestCase):
     def test_no_errors(self):
         findings = compose.lint(VALID)
         self.assertEqual(_levels(findings, compose.ERROR), [], _messages(findings))
 
 
+@needs_yaml
 class TestLintRules(unittest.TestCase):
     def test_missing_services(self):
         findings = compose.lint("volumes:\n  data:\n")
@@ -266,6 +274,232 @@ class TestLintRules(unittest.TestCase):
             compose.lint(text)  # Must not raise.
 
 
+@needs_yaml
+class TestFindingLines(unittest.TestCase):
+    """Where a finding points.
+
+    The editor jumps the cursor to ``finding.line`` and highlights it, so an
+    anchor that lands on the wrong service is worse than no anchor at all.
+    :func:`compose._line_of_key` searches forward from the service's own line
+    precisely because keys like ``image`` repeat in every service.
+    """
+
+    TWO_SERVICES = (
+        "services:\n"
+        "  a:\n    image: nginx:1.27\n    restart: always\n"
+        "  b:\n    image: redis\n    restart: always\n"
+    )
+
+    def _find(self, text, needle):
+        matches = [f for f in compose.lint(text) if needle in f.message]
+        self.assertEqual(len(matches), 1, _messages(compose.lint(text)))
+        return matches[0]
+
+    def test_anchor_skips_the_earlier_service_with_the_same_key(self):
+        finding = self._find(self.TWO_SERVICES, "'b' uses")
+        self.assertEqual(finding.line, 6)  # b's own image line, not a's.
+
+    def test_service_level_finding_points_at_the_service_key(self):
+        finding = self._find(self.TWO_SERVICES, "'b' has no healthcheck")
+        self.assertEqual(finding.line, 5)
+
+    def test_version_finding_points_at_the_version_line(self):
+        text = 'version: "3.8"\nservices:\n  w:\n    image: x:1\n    restart: always\n'
+        self.assertEqual(self._find(text, "obsolete").line, 1)
+
+    def test_tab_finding_points_at_the_offending_line(self):
+        findings = compose.lint("services:\n  web:\n\t\timage: x:1\n")
+        tabs = [f for f in findings if "Tab character" in f.message]
+        self.assertEqual([f.line for f in tabs], [3])
+
+    def test_secret_finding_points_at_the_variable(self):
+        text = (
+            "services:\n  w:\n    image: x:1\n    restart: always\n"
+            "    environment:\n      TZ: UTC\n      DB_PASSWORD: hunter2\n"
+        )
+        self.assertEqual(self._find(text, "DB_PASSWORD").line, 7)
+
+    def test_missing_key_falls_back_to_the_service_line(self):
+        # 'restart' is absent by definition, so there is no line to point at.
+        finding = self._find("services:\n  w:\n    image: x:1\n", "restart policy")
+        self.assertEqual(finding.line, 2)
+
+    def test_line_of_key_ignores_a_key_used_as_a_value(self):
+        self.assertEqual(compose._line_of_key("a: image\nimage: b\n", "image"), 2)
+
+    def test_line_of_key_matches_a_key_inside_a_list_item(self):
+        self.assertEqual(
+            compose._line_of_key("ports:\n  - target: 80\n", "target"), 2
+        )
+
+    def test_line_of_key_with_no_match_returns_the_starting_point(self):
+        self.assertEqual(compose._line_of_key("a: 1\n", "nope", after=7), 7)
+
+    def test_line_of_key_falls_back_to_an_earlier_occurrence(self):
+        # Searching forward found nothing; anywhere in the file beats nothing.
+        self.assertEqual(compose._line_of_key("image: a\nb: 1\n", "image", after=2), 1)
+
+    def test_line_of_key_with_an_empty_key(self):
+        self.assertEqual(compose._line_of_key("a: 1\n", ""), 0)
+
+
+class TestPortRanges(unittest.TestCase):
+    """Published-port extraction for the range syntax."""
+
+    def test_range_expands_to_every_port(self):
+        self.assertEqual(
+            compose._published_ports(["8000-8002:80-82"]),
+            ["8000/tcp", "8001/tcp", "8002/tcp"],
+        )
+
+    @needs_yaml
+    def test_range_collision_is_detected(self):
+        text = (
+            "services:\n"
+            '  a:\n    image: x:1\n    ports:\n      - "8000-8002:80-82"\n'
+            '  b:\n    image: y:1\n    ports:\n      - "8001:90"\n'
+        )
+        errors = _levels(compose.lint(text), compose.ERROR)
+        self.assertTrue(any("8001" in f.message for f in errors), _messages(errors))
+
+    def test_range_carries_the_protocol(self):
+        self.assertEqual(
+            compose._published_ports(["53-54:53/udp"]), ["53/udp", "54/udp"]
+        )
+
+    def test_inverted_range_is_ignored(self):
+        self.assertEqual(compose._published_ports(["9000-8000:80"]), [])
+
+    def test_absurdly_wide_range_is_ignored(self):
+        # Expanding it would add thousands of findings and help nobody.
+        self.assertEqual(compose._published_ports(["1-5000:80"]), [])
+
+    def test_non_numeric_range_is_ignored(self):
+        self.assertEqual(compose._published_ports(["${FROM}-${TO}:80"]), [])
+
+    def test_interpolated_host_port_is_ignored(self):
+        self.assertEqual(compose._published_ports(["${PORT}:80"]), [])
+
+    def test_ports_must_be_a_list(self):
+        for value in (None, "8080:80", {"published": 80}, 8080):
+            with self.subTest(value):
+                self.assertEqual(compose._published_ports(value), [])
+
+    def test_long_syntax_without_published_gets_an_ephemeral_port(self):
+        self.assertEqual(compose._published_ports([{"target": 80}]), [])
+
+    def test_long_syntax_protocol_defaults_to_tcp(self):
+        self.assertEqual(
+            compose._published_ports([{"target": 80, "published": 8080}]),
+            ["8080/tcp"],
+        )
+
+
+@needs_yaml
+class TestVolumeAndNetworkShapes(unittest.TestCase):
+    """Compose accepts several shapes for these fields; all must be understood."""
+
+    def test_long_syntax_named_volume_is_checked(self):
+        text = (
+            "services:\n  w:\n    image: x:1\n    restart: always\n"
+            "    volumes:\n      - type: volume\n        source: vol\n"
+            "        target: /data\n"
+        )
+        errors = _levels(compose.lint(text), compose.ERROR)
+        self.assertTrue(any("'vol'" in f.message for f in errors), _messages(errors))
+
+    def test_long_syntax_bind_mount_is_not_a_named_volume(self):
+        text = (
+            "services:\n  w:\n    image: x:1\n    restart: always\n"
+            "    volumes:\n      - type: bind\n        source: ./cfg\n"
+            "        target: /cfg\n"
+        )
+        self.assertFalse(any("named volume" in f.message for f in compose.lint(text)))
+
+    def test_anonymous_volume_needs_no_declaration(self):
+        text = (
+            "services:\n  w:\n    image: x:1\n    restart: always\n"
+            "    volumes:\n      - /data\n"
+        )
+        self.assertFalse(any("named volume" in f.message for f in compose.lint(text)))
+
+    def test_volumes_declared_as_a_list(self):
+        text = (
+            "services:\n  w:\n    image: x:1\n    restart: always\n"
+            "    volumes:\n      - data:/data\n"
+            "volumes:\n  - data\n"
+        )
+        self.assertFalse(any("named volume" in f.message for f in compose.lint(text)))
+
+    def test_networks_in_mapping_form(self):
+        text = (
+            "services:\n  w:\n    image: x:1\n    restart: always\n"
+            "    networks:\n      missing:\n        aliases: [w]\n"
+        )
+        errors = _levels(compose.lint(text), compose.ERROR)
+        self.assertTrue(any("missing" in f.message for f in errors), _messages(errors))
+
+    def test_depends_on_as_a_bare_string(self):
+        text = "services:\n  w:\n    image: x:1\n    depends_on: ghost\n"
+        errors = _levels(compose.lint(text), compose.ERROR)
+        self.assertTrue(any("ghost" in f.message for f in errors), _messages(errors))
+
+    def test_environment_key_with_no_value(self):
+        # 'DB_PASSWORD:' with nothing after it passes the host's value through,
+        # so there is no literal in the file to warn about.
+        text = (
+            "services:\n  w:\n    image: x:1\n    restart: always\n"
+            "    environment:\n      DB_PASSWORD:\n"
+        )
+        self.assertFalse(any("literal value" in f.message for f in compose.lint(text)))
+
+    def test_environment_list_entry_without_a_value(self):
+        text = (
+            "services:\n  w:\n    image: x:1\n    restart: always\n"
+            "    environment:\n      - DB_PASSWORD\n"
+        )
+        self.assertFalse(any("literal value" in f.message for f in compose.lint(text)))
+
+    def test_service_that_is_not_a_mapping(self):
+        findings = compose.lint("services:\n  w: 5\n")
+        self.assertTrue(any("not a mapping" in f.message for f in findings))
+
+
+class TestWithoutPyYAML(unittest.TestCase):
+    """Degraded mode: PyYAML is an optional dependency.
+
+    Without it the editor leans on the host's ``docker compose config``, so the
+    contract here is that the cheap textual rules still run and nothing raises.
+    """
+
+    def setUp(self):
+        patcher = mock.patch.object(compose, "YAML_AVAILABLE", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_parse_reports_neither_data_nor_error(self):
+        result = compose.parse(VALID)
+        self.assertIsNone(result.data)
+        self.assertIsNone(result.error)
+        self.assertFalse(result.ok)
+
+    def test_textual_rules_still_run(self):
+        findings = compose.lint("services:\n\tweb:\n")
+        self.assertTrue(any("Tab character" in f.message for f in findings))
+
+    def test_structural_rules_are_skipped(self):
+        # nginx (untagged) would warn if the document could be parsed.
+        self.assertEqual(compose.lint("services:\n  w:\n    image: nginx\n"), [])
+
+    def test_service_names_fall_back_to_the_regex_scan(self):
+        self.assertEqual(compose.service_names(VALID), ["web"])
+
+    def test_lint_never_raises(self):
+        for text in ("", "   ", "services:", "a: [1, 2\n", "\x00\x01"):
+            with self.subTest(text):
+                compose.lint(text)
+
+
 class TestServiceNames(unittest.TestCase):
     def test_from_valid_document(self):
         self.assertEqual(compose.service_names(VALID), ["web"])
@@ -277,6 +511,25 @@ class TestServiceNames(unittest.TestCase):
 
     def test_no_services(self):
         self.assertEqual(compose.service_names("volumes:\n  a:\n"), [])
+
+    def test_regex_scan_ignores_nested_block_openers(self):
+        # 'ports:' and 'healthcheck:' look just like a service key one level in.
+        self.assertEqual(compose._service_names_by_regex(VALID), ["web"])
+
+    def test_regex_scan_stops_at_the_next_top_level_key(self):
+        text = "services:\n  web:\n    image: x\nvolumes:\n  data:\n"
+        self.assertEqual(compose._service_names_by_regex(text), ["web"])
+
+    def test_regex_scan_allows_a_trailing_comment_on_the_service_key(self):
+        text = "services:\n  web:  # the front end\n    image: x\n"
+        self.assertEqual(compose._service_names_by_regex(text), ["web"])
+
+    def test_regex_scan_skips_comment_lines(self):
+        text = "services:\n  # disabled for now\n  web:\n    image: x\n"
+        self.assertEqual(compose._service_names_by_regex(text), ["web"])
+
+    def test_regex_scan_without_a_services_block(self):
+        self.assertEqual(compose._service_names_by_regex("volumes:\n  a:\n"), [])
 
 
 class TestSummarize(unittest.TestCase):

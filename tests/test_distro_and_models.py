@@ -9,6 +9,7 @@ from models.host import (
     Container,
     DockerStack,
     Host,
+    merge_stacks,
 )
 
 
@@ -133,6 +134,96 @@ class TestHost(unittest.TestCase):
              "stacks": [{"no_path": 1}, "not a dict", None]}
         )
         self.assertEqual(host.stacks, [])
+
+    def test_one_unloadable_stack_does_not_cost_the_host(self):
+        # A record with a path but no compose_file used to raise out of
+        # from_dict, so the caller skipped the entire host.
+        host = Host.from_dict(
+            {
+                "hostname": "h",
+                "username": "u",
+                "stacks": [
+                    {"path": "/opt/broken"},  # no name, no compose_file
+                    {"name": "ok", "path": "/opt/ok",
+                     "compose_file": "/opt/ok/docker-compose.yml"},
+                ],
+            }
+        )
+        self.assertEqual(host.hostname, "h")
+        self.assertEqual([s.name for s in host.stacks], ["ok"])
+
+    def test_stacks_not_a_list_is_ignored(self):
+        host = Host.from_dict({"hostname": "h", "username": "u", "stacks": "nonsense"})
+        self.assertEqual(host.stacks, [])
+
+
+class TestMergeStacks(unittest.TestCase):
+    """A rescan must not throw away the rollback points only we know about."""
+
+    @staticmethod
+    def _stack(path: str, **kwargs) -> DockerStack:
+        return DockerStack(
+            name=path.rsplit("/", 1)[-1],
+            path=path,
+            compose_file=f"{path}/docker-compose.yml",
+            **kwargs,
+        )
+
+    def test_snapshot_survives_a_rescan(self):
+        previous = [
+            self._stack(
+                "/opt/app",
+                image_snapshot={"app:latest": "sha256:" + "a" * 64},
+                snapshot_taken="2026-07-25 10:00",
+            )
+        ]
+        merged = merge_stacks(previous, [self._stack("/opt/app")])
+        self.assertEqual(merged[0].image_snapshot, {"app:latest": "sha256:" + "a" * 64})
+        self.assertEqual(merged[0].snapshot_taken, "2026-07-25 10:00")
+        self.assertTrue(merged[0].can_roll_back)
+
+    def test_a_fresh_snapshot_is_not_overwritten(self):
+        previous = [self._stack("/opt/app", image_snapshot={"app:1": "sha256:old"})]
+        discovered = [self._stack("/opt/app", image_snapshot={"app:1": "sha256:new"})]
+        merged = merge_stacks(previous, discovered)
+        self.assertEqual(merged[0].image_snapshot, {"app:1": "sha256:new"})
+
+    def test_trailing_slashes_still_match(self):
+        previous = [self._stack("/opt/app/", image_snapshot={"a": "sha256:x"})]
+        merged = merge_stacks(previous, [self._stack("/opt/app")])
+        self.assertEqual(merged[0].image_snapshot, {"a": "sha256:x"})
+
+    def test_a_moved_stack_does_not_inherit(self):
+        previous = [self._stack("/opt/app", image_snapshot={"a": "sha256:x"})]
+        merged = merge_stacks(previous, [self._stack("/srv/app")])
+        self.assertEqual(merged[0].image_snapshot, {})
+        self.assertFalse(merged[0].can_roll_back)
+
+    def test_a_vanished_stack_is_not_resurrected(self):
+        previous = [self._stack("/opt/gone", image_snapshot={"a": "sha256:x"})]
+        merged = merge_stacks(previous, [self._stack("/opt/here")])
+        self.assertEqual([s.path for s in merged], ["/opt/here"])
+
+    def test_the_carried_snapshot_is_a_copy(self):
+        # Sharing the dict would make an update to one stack mutate the other.
+        previous = [self._stack("/opt/app", image_snapshot={"a": "sha256:x"})]
+        merged = merge_stacks(previous, [self._stack("/opt/app")])
+        merged[0].image_snapshot["b"] = "sha256:y"
+        self.assertEqual(previous[0].image_snapshot, {"a": "sha256:x"})
+
+    def test_empty_previous_list_is_a_no_op(self):
+        discovered = [self._stack("/opt/app")]
+        self.assertEqual(merge_stacks([], discovered), discovered)
+
+    def test_survives_a_round_trip_through_json(self):
+        # The point of the merge is a rollback that outlives the session.
+        stack = self._stack(
+            "/opt/app", image_snapshot={"a": "sha256:x"}, snapshot_taken="then"
+        )
+        host = Host.from_dict(Host("h", "u", stacks=[stack]).to_dict())
+        merged = merge_stacks(host.stacks, [self._stack("/opt/app")])
+        self.assertEqual(merged[0].image_snapshot, {"a": "sha256:x"})
+        self.assertEqual(merged[0].snapshot_taken, "then")
 
 
 class TestContainer(unittest.TestCase):

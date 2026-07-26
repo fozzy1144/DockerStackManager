@@ -61,6 +61,9 @@ class CodeEditor(ctk.CTkFrame):
         super().__init__(parent, fg_color=BG, corner_radius=6, **kwargs)
         self._on_change = on_change
         self._highlight_job: Optional[str] = None
+        self._highlighted: Optional[str] = None
+        """Buffer contents as of the last re-tag, so an unchanged one is skipped."""
+
         self._match_count = 0
         self._current_match = 0
 
@@ -134,6 +137,9 @@ class CodeEditor(ctk.CTkFrame):
     def set_text(self, content: str, *, mark_clean: bool = True) -> None:
         """Replace the buffer. Clears the undo history when marking clean."""
         self.text.configure(state="normal")
+        # Deleting the buffer drops its tags, so the "already highlighted" note
+        # must go with them — reloading identical content still needs a re-tag.
+        self._highlighted = None
         self.text.delete("1.0", "end")
         self.text.insert("1.0", content)
         self.text.mark_set("insert", "1.0")
@@ -285,16 +291,23 @@ class CodeEditor(ctk.CTkFrame):
             self._highlight_job = None
 
     def _highlight_now(self) -> None:
-        """Re-tag the whole buffer.
+        """Re-tag the whole buffer, unless it has not changed since last time.
 
         Whole-buffer work is fine here: compose files are small, and doing it in
-        one pass avoids the bookkeeping of tracking which lines changed.
+        one pass avoids the bookkeeping of tracking which lines changed. The
+        early return matters because moving the cursor also fires ``<<Change>>``
+        — the gutter needs to know — so holding an arrow key would otherwise
+        re-tag every line of the file on each keypress.
         """
         self._highlight_job = None
+        content = self.text.get("1.0", "end-1c")
+        if content == self._highlighted:
+            return
+        self._highlighted = content
+
         for name in SYNTAX_COLORS:
             self.text.tag_remove(name, "1.0", "end")
 
-        content = self.text.get("1.0", "end-1c")
         for number, line in enumerate(content.split("\n"), start=1):
             if line.strip():
                 self._highlight_line(number, line)

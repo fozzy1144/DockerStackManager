@@ -302,6 +302,18 @@ class TestImportPlanning(unittest.TestCase):
         existing = [Host("example.com", "deploy", key_path="/k")]
         self.assertEqual(plan_import(config, existing)[0].action, ACTION_SKIP)
 
+    def test_existing_hosts_may_be_a_one_shot_iterable(self):
+        # The signature promises an Iterable. Re-listing it per candidate meant
+        # the second pass saw nothing, so every host looked unconfigured.
+        config = [
+            SSHConfigHost("a", "10.0.0.1", "u", identity_file="/k"),
+            SSHConfigHost("b", "10.0.0.2", "u", identity_file="/k"),
+        ]
+        existing = iter([Host("10.0.0.1", "u"), Host("10.0.0.2", "u")])
+        plan = plan_import(config, existing)
+        self.assertEqual([c.action for c in plan], [ACTION_ATTACH_KEY] * 2)
+        self.assertEqual([c.existing_index for c in plan], [0, 1])
+
     def test_existing_index_points_at_the_right_host(self):
         config = [SSHConfigHost("c", "10.0.0.3", "u", identity_file="/k")]
         existing = [Host("10.0.0.1", "u"), Host("10.0.0.2", "u"), Host("10.0.0.3", "u")]

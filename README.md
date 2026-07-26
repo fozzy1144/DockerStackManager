@@ -115,7 +115,7 @@ Logs stream with a tail length, an optional service filter, and follow on or off
 
 When it cannot tell, it says **unknown** and why. That is deliberate: a false "up to date" hides a security update, and a false "update available" trains you to ignore the indicator. The honest unknown cases are a registry it cannot reach, an image not present locally, and a multi-arch image on a host without buildx.
 
-**Roll back** restores the image versions recorded before the last update. Every update through this application snapshots each image's ID first — IDs, not tags, because a pull moves the tag and leaves the previous image on disk untagged, identifiable only by ID. Rollback re-tags those IDs and forces a recreate.
+**Roll back** restores the image versions recorded before the last update. Every update through this application snapshots each image's ID first — IDs, not tags, because a pull moves the tag and leaves the previous image on disk untagged, identifiable only by ID. Rollback re-tags those IDs and forces a recreate. Rollback points are stored per stack directory and carried across stack rescans, so they outlive both the rescan that follows an update and the session itself.
 
 It refuses, without changing anything, if any recorded image has since been removed from the host: a partial rollback would leave the stack matching neither version. `docker image prune` deletes untagged images, so pruning discards your rollback points — worth knowing before using **Cleanup**.
 
@@ -247,7 +247,7 @@ Four conventions hold the layers apart and are worth preserving:
 
 **Nothing blocks the UI thread.** Every network call runs on a worker thread and returns via `after()`. The one exception is logging: `LogPanel.log` is safe to call from any thread because it only enqueues, and a single timer drains the queue with one batched widget insert per tick — which is what keeps the window responsive while `apt` streams thousands of lines.
 
-**Config writes never block the window.** `save_hosts_async` serialises on the calling thread — so the snapshot cannot tear — and defers only the disk write, coalescing bursts into one. A bulk check finishing on nine hosts at once costs a single write. The shutdown path saves synchronously and flushes, because a deferred write must not die with the process.
+**Config writes never block the window.** `save_hosts_async` serialises on the calling thread — so the snapshot cannot tear — and defers only the disk write, coalescing bursts into one. A bulk check finishing on nine hosts at once costs a single write. On shutdown the deferred writer is flushed *first* and the final save then made synchronously, because a deferred write must neither die with the process nor land after — and overwrite — the last save.
 
 **A pending connection must not lock the window.** Connecting deliberately does *not* set the busy flag, and the attempt is tracked by a token so switching hosts mid-connect abandons it. An apparently frozen window while a dead host timed out was a real bug; the reachability probe and this token are the two halves of the fix.
 

@@ -1,9 +1,42 @@
 """Modal dialog for adding or editing a host."""
 
 import os
+from typing import Optional
+
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+MIN_PORT = 1
+MAX_PORT = 65535
+
+
+def expand_key_path(value: str) -> str:
+    """Resolve ``~`` and environment variables in a key path, and unquote it.
+
+    The field's own placeholder suggests ``~/.ssh/id_rsa``, and an SSH config
+    import supplies paths in the same form — but neither :func:`os.path.isfile`
+    nor paramiko expands a tilde, so taking the text literally rejected a key
+    that was sitting right there.
+    """
+    cleaned = value.strip().strip('"')
+    if not cleaned:
+        return ""
+    return os.path.expandvars(os.path.expanduser(cleaned))
+
+
+def parse_port(value: str) -> Optional[int]:
+    """Parse a port, or ``None`` if it is not a usable one.
+
+    Range-checked, not merely numeric: ``0`` and ``70000`` parse fine as integers
+    and then fail at connect time with an error about the host rather than the
+    port that was actually wrong.
+    """
+    try:
+        port = int(value.strip())
+    except (AttributeError, ValueError):
+        return None
+    return port if MIN_PORT <= port <= MAX_PORT else None
 
 
 class HostDialog(ctk.CTkToplevel):
@@ -116,7 +149,7 @@ class HostDialog(ctk.CTkToplevel):
         hostname = self._host_entry.get().strip()
         username = self._user.get().strip()
         password = self._pass.get()
-        key_path = self._key_var.get().strip()
+        key_path = expand_key_path(self._key_var.get())
         port_str = self._port.get().strip() or "22"
 
         if not hostname:
@@ -136,10 +169,13 @@ class HostDialog(ctk.CTkToplevel):
             messagebox.showerror("Validation", f"Key file not found:\n{key_path}", parent=self)
             return
 
-        try:
-            port = int(port_str)
-        except ValueError:
-            messagebox.showerror("Validation", "Port must be a number.", parent=self)
+        port = parse_port(port_str)
+        if port is None:
+            messagebox.showerror(
+                "Validation",
+                f"Port must be a whole number between {MIN_PORT} and {MAX_PORT}.",
+                parent=self,
+            )
             return
 
         self.result = {

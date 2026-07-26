@@ -77,7 +77,7 @@ class LogPanel(ctk.CTkFrame):
 
     def clear(self) -> None:
         """Discard everything displayed, and anything still queued."""
-        self._drain()
+        self._discard_queued()
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
         self._text.configure(state="disabled")
@@ -112,6 +112,21 @@ class LogPanel(ctk.CTkFrame):
             except queue.Empty:
                 break
         return items
+
+    def _discard_queued(self) -> int:
+        """Throw away every queued line, however many there are.
+
+        Clearing has to be unbounded, unlike a flush: an ``apt`` run can queue
+        thousands of lines, and draining only one flush's worth meant Clear
+        emptied the view and then watched the backlog scroll straight back in.
+        """
+        discarded = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return discarded
+            discarded += 1
 
     def _flush(self) -> None:
         items = self._drain()

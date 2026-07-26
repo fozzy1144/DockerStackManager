@@ -64,6 +64,9 @@ class ComposeEditor(ctk.CTkToplevel):
         self._busy = False
         self._findings: list[compose.Finding] = []
         self._lint_job: Optional[str] = None
+        self._linted_text: Optional[str] = None
+        """Text as of the last lint pass; an unchanged buffer is not re-linted."""
+
         self._last_status: tuple[str, str] = ("", "")
         self._sticky_until = 0.0
 
@@ -329,8 +332,18 @@ class ComposeEditor(ctk.CTkToplevel):
             self._lint_job = None
 
     def _run_lint(self) -> None:
+        """Re-check the buffer, unless it is the one already checked.
+
+        Cursor movement reaches here too — it fires the editor's change event so
+        the gutter can follow — and a re-lint then means parsing the document and
+        rebuilding the findings list to produce exactly the same answer.
+        """
         self._lint_job = None
         text = self._editor.get_text()
+        if text == self._linted_text:
+            return
+        self._linted_text = text
+
         self._findings = compose.lint(text)
         self._findings_panel.show(self._findings)
         self._editor.highlight_error_lines(

@@ -417,9 +417,12 @@ def plan_import(
     reached as two different accounts is genuinely two entries here, because the
     credentials and the privileges differ.
     """
+    # Materialised once. Re-listing per candidate was quadratic, and silently
+    # wrong for any one-shot iterable, which the signature permits.
+    current_hosts = list(existing)
     index_by_key = {
         _match_key(host.hostname, host.username, host.port): position
-        for position, host in enumerate(existing)
+        for position, host in enumerate(current_hosts)
     }
 
     candidates: list[ImportCandidate] = []
@@ -443,7 +446,7 @@ def plan_import(
             )
             continue
 
-        current = list(existing)[position]
+        current = current_hosts[position]
         if config_host.identity_file and not getattr(current, "key_path", ""):
             candidates.append(
                 ImportCandidate(

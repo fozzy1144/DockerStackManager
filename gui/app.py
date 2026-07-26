@@ -46,7 +46,13 @@ from gui.theme import (
     MUTED,
     state_color,
 )
-from models.host import UPDATES_FAILED, UPDATES_UNKNOWN, DockerStack, Host
+from models.host import (
+    UPDATES_FAILED,
+    UPDATES_UNKNOWN,
+    DockerStack,
+    Host,
+    merge_stacks,
+)
 
 MAX_PARALLEL_HOSTS = 8
 """Cap on concurrent SSH sessions during a bulk action.
@@ -429,7 +435,16 @@ class App(ctk.CTk):
     # ──────────────────────────────────────────────────────────────────────────
 
     def _select_host(self, host: Host) -> None:
-        if self._busy or host is self._active:
+        if host is self._active:
+            return
+        if self._busy:
+            # Say so. Silently ignoring the click made the sidebar look broken
+            # for however long a scan or an update happened to be running.
+            self._log.log(
+                f"Busy — finish or wait for the current operation before "
+                f"switching to {host.display_name}.",
+                "warn",
+            )
             return
         self._disconnect()
         self._active = host
@@ -624,7 +639,9 @@ class App(ctk.CTk):
         if host is not self._active:
             return  # Host was switched while the scan ran.
 
-        host.stacks = stacks
+        # Carry rollback points across the rescan. A scan only reports what is on
+        # the host, and the recorded pre-update image versions are ours alone.
+        host.stacks = merge_stacks(host.stacks, stacks)
         self._save_hosts_soon()
         self._populate_stacks(stacks)
         self._log.log(f"Found {len(stacks)} stack(s).", "success" if stacks else "warn")
@@ -1014,10 +1031,11 @@ class App(ctk.CTk):
     def _on_close(self) -> None:
         self._disconnect()
         try:
-            # Synchronous on the way out, then wait for anything the background
-            # writer still holds: a deferred write must not die with the process.
-            save_hosts(self._hosts)
+            # Let the background writer finish first, then write synchronously.
+            # The other order let a deferred (older) payload land *after* the
+            # final save and undo the last change made before closing.
             flush_pending_saves()
+            save_hosts(self._hosts)
         except OSError:
             pass  # Nothing useful to show; the window is already closing.
         self.destroy()

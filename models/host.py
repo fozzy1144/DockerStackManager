@@ -82,6 +82,32 @@ class DockerStack:
         return bool(self.image_snapshot)
 
 
+def merge_stacks(
+    previous: list[DockerStack], discovered: list[DockerStack]
+) -> list[DockerStack]:
+    """Return ``discovered``, carrying each stack's rollback point forward.
+
+    A rescan builds fresh stacks from what the host reports, and the host cannot
+    tell us which image versions preceded the last pull — that is recorded here,
+    locally. Replacing the list wholesale therefore threw every rollback point
+    away, including the one an update had just taken seconds earlier, since a
+    rescan is exactly what follows an update.
+
+    Matched on :attr:`DockerStack.path`, which is what identifies a project on
+    the host. A stack whose directory has genuinely moved starts over, because
+    the images its old location recorded may no longer be the ones it runs.
+    """
+    remembered = {
+        stack.path.rstrip("/"): stack for stack in previous if stack.image_snapshot
+    }
+    for stack in discovered:
+        earlier = remembered.get(stack.path.rstrip("/"))
+        if earlier is not None and not stack.image_snapshot:
+            stack.image_snapshot = dict(earlier.image_snapshot)
+            stack.snapshot_taken = earlier.snapshot_taken
+    return discovered
+
+
 @dataclass(frozen=True, slots=True)
 class Container:
     """One container belonging to a stack, as ``docker compose ps`` reports it.
@@ -168,17 +194,34 @@ class Host:
     def from_dict(cls, data: dict) -> "Host":
         """Build a Host from persisted JSON, tolerating unknown or missing keys.
 
-        Raises :class:`KeyError` only when ``hostname`` or ``username`` — the two
+        Raises :class:`TypeError` only when ``hostname`` or ``username`` — the two
         fields without a sensible default — are absent; callers skip such
         entries rather than let one bad record stop the app from starting.
         """
         host = _build(cls, data)
-        host.stacks = [
-            DockerStack.from_dict(s)
-            for s in data.get("stacks") or []
-            if isinstance(s, dict) and s.get("path")
-        ]
+        host.stacks = _load_stacks(data.get("stacks"))
         return host
+
+
+def _load_stacks(raw: object) -> list[DockerStack]:
+    """Build a host's stacks, skipping any record that will not load.
+
+    Per-record tolerance, for the same reason :func:`gui.app._read_hosts` has it:
+    one unusable stack should cost that stack, not the host it belongs to — which
+    is what a record missing ``compose_file`` used to do, by raising out of
+    :meth:`Host.from_dict` entirely.
+    """
+    if not isinstance(raw, list):
+        return []
+    stacks: list[DockerStack] = []
+    for entry in raw:
+        if not isinstance(entry, dict) or not entry.get("path"):
+            continue
+        try:
+            stacks.append(DockerStack.from_dict(entry))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return stacks
 
 
 def _build(cls, data: dict):

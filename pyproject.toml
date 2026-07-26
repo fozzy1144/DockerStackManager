@@ -9,6 +9,7 @@ description = "Desktop GUI for managing and updating Linux hosts and Docker Comp
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Evan Stade" }]
 keywords = ["docker", "compose", "ssh", "sysadmin", "gui"]
 classifiers = [

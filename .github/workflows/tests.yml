@@ -26,9 +26,9 @@ jobs:
         python-version: ["3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -56,9 +56,9 @@ jobs:
     # cheapest way to catch a syntax error or a bad import in one of them.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -83,9 +83,9 @@ jobs:
     needs: [test, import-check]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -104,7 +104,7 @@ jobs:
           if (-not (Test-Path dist/DockerStackManager.exe)) { exit 1 }
           "{0:N1} MB" -f ((Get-Item dist/DockerStackManager.exe).Length / 1MB)
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: DockerStackManager-exe
           path: dist/DockerStackManager.exe

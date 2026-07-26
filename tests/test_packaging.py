@@ -62,6 +62,15 @@ class TestMetadata(unittest.TestCase):
         ]
         self.assertIn(attribute, functions)
 
+    def test_the_declared_license_ships_with_the_package(self):
+        # Metadata claiming MIT with no license text is a problem for anyone
+        # redistributing the wheel, and the README badge says the same thing.
+        self.assertEqual(self.project["license"], "MIT")
+        self.assertEqual(self.project["license-files"], ["LICENSE"])
+        license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        self.assertIn("MIT License", license_text)
+        self.assertIn("Copyright (c)", license_text)
+
     def test_declared_packages_exist(self):
         for package in self.pyproject["tool"]["setuptools"]["packages"]:
             with self.subTest(package):

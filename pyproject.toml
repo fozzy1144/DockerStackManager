@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "docker-stack-manager"
-version = "1.0.0"
+version = "1.0.1"
 description = "Desktop GUI for managing and updating Linux hosts and Docker Compose stacks over SSH"
 readme = "README.md"
 requires-python = ">=3.12"

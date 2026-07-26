@@ -261,6 +261,21 @@ Python 3.12 and 3.13, re-runs the compose tests with PyYAML *uninstalled* to
 keep the degraded path honest, imports every GUI module, and freezes the
 executable.
 
+For a coverage report:
+
+```bash
+pip install -e ".[dev]"
+python -m pytest --cov=core --cov=gui --cov=models --cov-report=term-missing
+```
+
+CI enforces a floor so the figure can only go up. Where the gaps are, and why:
+`core/` is well covered because none of it needs a display, and `core/compose.py`
+and `models/host.py` are effectively complete. The remainder is concentrated in
+two places — the parts of `core/ssh_client.py` that only run against a live host,
+and widget construction in `gui/`, where the tests deliberately cover the pure
+helpers and the lookup tables that have to agree with `core/` rather than
+instantiating windows.
+
 ## Building a Windows executable
 
 ```bash

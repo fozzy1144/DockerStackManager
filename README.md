@@ -8,7 +8,7 @@ A desktop GUI for managing and updating Linux hosts and Docker Compose stacks ov
 
 ## Features
 
-- **Multi-host management** — add as many Linux hosts as you need; switch between them with one click
+- **Multi-host management** — add as many Linux hosts as you need; switch between them with one click, or double-click to connect
 - **Import from your SSH config** — pulls in the same hosts VS Code Remote-SSH uses, including key paths, so a machine you already reach from the editor is one click from being managed here
 - **Secure credentials** — passwords stored in the OS credential manager (Windows Credential Manager); never written to disk in plaintext
 - **SSH key support** — connect with a private key file instead of (or alongside) a password
@@ -18,7 +18,7 @@ A desktop GUI for managing and updating Linux hosts and Docker Compose stacks ov
 - **Selective stack updates** — checkboxes let you pick exactly which stacks to pull and recreate
 - **System package upgrades** — runs the right package manager (`apt`, `dnf`, `pacman`, `apk`, `zypper`) for the detected OS
 - **Works as root or not** — detects passwordless `sudo` and whether your user can reach the Docker socket, and escalates only when it has to
-- **Bulk operations** — check for updates or run a full system update across every host at once, several hosts in parallel
+- **Bulk operations** — check for updates or run a full system update across every host at once, several hosts in parallel; a switch on each host decides whether it takes part; each host's output is colour-coded in the activity log, matching a marker on its card
 - **Live log output** — stack pulls and package upgrades stream line by line as they happen, and can be saved to a file
 - **Compose editor** — edit a stack's compose file in place with YAML highlighting, live checks, an example library, a diff before saving, host-side validation, and an automatic timestamped backup
 - **Per-stack control** — container list with health and published ports, lifecycle buttons (up, restart, stop, pull, recreate, down), and log following per service
@@ -29,11 +29,11 @@ A desktop GUI for managing and updating Linux hosts and Docker Compose stacks ov
 
 ## Screenshots
 
-Hosts, stacks and live output in one window. Each stack has **Manage** and **Edit**; the sidebar shows pending OS updates per host, including a host that could not be reached.
+Hosts, stacks and live activity in one window, part-way through a fleet-wide update check: each host's lines carry its own colour in the activity log, the same colour as the dot on its card, which pulses while that host is still working. Each stack has **Manage** and an edit (pencil) button; the sidebar shows pending OS updates per host, including a host that could not be reached.
 
 ![Main window](docs/Screenshot.png)
 
-The compose editor: YAML highlighting, the documented example library on the left, and the checks panel calling out an unpinned tag and a missing restart policy.
+The compose editor: YAML highlighting, the documented example library on the left, find and replace, and the checks panel calling out an unpinned tag and a missing restart policy.
 
 ![Compose editor](docs/Screenshot-editor.png)
 
@@ -61,11 +61,14 @@ pip install .
 
 ## Running
 
-**Windows:**
+**Windows:** double-click `run.pyw`, or from a terminal:
 
 ```bat
 run.bat
 ```
+
+Both start the app without a console window; if it cannot start, the reason is
+shown in a dialog. Use `python main.py` when you want the console.
 
 **Any platform:**
 
@@ -77,7 +80,7 @@ python main.py
 
 ### Importing the hosts you already have
 
-Click **Import…** next to *+ Add Host*. This reads your OpenSSH config — which is exactly where **VS Code Remote-SSH** gets its host list from, so anything you connect to in the editor shows up here.
+Click **Import…** at the bottom of the sidebar. This reads your OpenSSH config — which is exactly where **VS Code Remote-SSH** gets its host list from, so anything you connect to in the editor shows up here.
 
 Read from `~/.ssh/config`, or from `remote.SSH.configFile` if you have set it in VS Code. `Include` directives are followed, and OpenSSH's rules are honoured: a `Host` line may carry several patterns, and the *first* value obtained for a keyword wins (which is why `Host *` defaults belong at the bottom of the file). `Match` blocks are skipped, because their conditions depend on the connection being attempted.
 
@@ -93,17 +96,23 @@ Nothing is written until you press Import, and passwords are never read from the
 
 Attaching a key does not disable password authentication: both are offered, so a host that only accepts a password keeps working. If a host needs a password for `sudo` as well as a key to log in, set the password in **Edit** — see [Privileges](#privileges).
 
-1. Click **+ Add Host** and enter the hostname/IP, port, username, and either a password or an SSH key file.
-2. Select the host from the sidebar and click **Connect**.
-3. Click **Scan Stacks** to discover all Docker Compose projects on the host.
-4. Check or uncheck stacks, then click **Update Selected Stacks** to pull new images and recreate containers.
-5. Optionally click **System Update** to run a full OS package upgrade.
+1. Click **Add host** (or `+` beside *Hosts*) and enter the hostname/IP, port, username, and either a password or an SSH key file.
+2. Select the host from the sidebar and click **Connect** — or just double-click the host.
+3. Click **Scan stacks** to discover all Docker Compose projects on the host.
+4. Check or uncheck stacks, then click **Update *N* stacks** to pull new images and recreate containers.
+5. Optionally click **System update** to run a full OS package upgrade.
 
-Or skip straight to **Check All Updates** / **Update All Hosts** in the sidebar to work across every configured host at once.
+Or skip straight to **Check for updates** / **Update all hosts** in the sidebar to work across every host at once. The switch on each host card decides whether it takes part — turn one off to leave, say, a production box out of a blanket upgrade. The choice is saved, and the sidebar shows how many hosts are included.
+
+Press `Ctrl+K` (or click the search field) for the command palette: type part of a host, stack or action — `upd med`, `clean` — and press Enter.
+
+Shortcuts: `Ctrl+K` command palette, `Ctrl+N` add host, `Ctrl+I` import, `F5` scan stacks, `Ctrl+L` clear the activity log. Right-click a host to connect, edit, remove, or leave it out of fleet-wide updates. The activity log's **All / Issues / Errors** filter hides routine lines without discarding them; a saved log always contains everything.
+
+The window reopens at its last size and position, on the host you had selected.
 
 ### Managing one stack
 
-Each discovered stack has two buttons.
+Each discovered stack has two buttons: **Manage**, and a pencil that opens its compose file.
 
 **Manage** opens a window with the stack's containers — service name, state, health, image, and published ports — plus lifecycle actions and log following:
 
@@ -116,7 +125,7 @@ Each discovered stack has two buttons.
 | Recreate | `up -d --force-recreate` | Rebuilds containers even if nothing changed. |
 | Down | `down` | Removes containers and the network. **Named volumes are kept.** |
 
-Logs stream with a tail length, an optional service filter, and follow on or off. **Stop** terminates the remote `logs -f` rather than abandoning it.
+Logs stream with a tail length, an optional service filter, and follow on or off; **Logs** on a container row jumps straight to that service. **Stop** terminates the remote `logs -f` rather than abandoning it.
 
 **Check images** asks each image's registry whether a newer version exists. Only manifests are fetched — no layers are downloaded — by comparing the digest the registry serves for a tag against the digest the local copy is stored under. `docker buildx imagetools` is preferred because it reports the *index* digest, which is what a multi-architecture image is recorded under locally; `docker manifest inspect` is the fallback.
 
@@ -126,7 +135,7 @@ When it cannot tell, it says **unknown** and why. That is deliberate: a false "u
 
 It refuses, without changing anything, if any recorded image has since been removed from the host: a partial rollback would leave the stack matching neither version. `docker image prune` deletes untagged images, so pruning discards your rollback points — worth knowing before using **Cleanup**.
 
-**Edit** opens the compose editor — see below.
+The **pencil** (or **Edit compose** inside the Manage window) opens the compose editor — see below.
 
 ### Editing a compose file
 
@@ -163,6 +172,7 @@ A failed pull deliberately aborts before `up`, because recreating containers aga
 | SSH host aliases and key paths | Read from `~/.ssh/config` on import; never written to |
 | Hosts, ports, key paths, discovered stacks | `~/.docker_stack_manager/hosts.json` |
 | Accepted SSH host keys | `~/.docker_stack_manager/known_hosts` |
+| Window size, position, last selected host | `~/.docker_stack_manager/ui.json` (safe to delete) |
 
 No credentials are ever written to `hosts.json` or to the project directory. The config file is written atomically — an interrupted save leaves the previous version intact rather than a truncated file — and a single malformed record is skipped at startup instead of stopping the app.
 
@@ -213,7 +223,8 @@ Docker commands follow the same idea: if your user cannot reach the Docker socke
 ```text
 DockerStackManager/
 ├── main.py                  # Entry point
-├── run.bat                  # Windows launcher
+├── run.bat                  # Windows launcher (no console window)
+├── run.pyw                  # The same, for double-clicking
 ├── requirements.txt
 ├── pyproject.toml           # Package metadata and dependency bounds
 ├── docker-stack-manager.spec  # PyInstaller build for the Windows executable
@@ -228,18 +239,22 @@ DockerStackManager/
 │   └── ssh_client.py        # SSH transport: connect, probe, run, stream, transfer
 ├── gui/
 │   ├── app.py               # Main window and action coordination
-│   ├── theme.py             # Shared severity and state colours
-│   ├── host_list.py         # Sidebar host cards
+│   ├── theme.py             # Design system: palette, type, widget recipes, window chrome
+│   ├── assets/              # App icon and sidebar logo
+│   ├── dialogs.py           # Themed confirm/alert dialogs and toasts
+│   ├── palette.py           # Ctrl+K command palette and its fuzzy matcher
+│   ├── settings.py          # Remembered window state
+│   ├── host_list.py         # Sidebar host cards and bulk-update switches, drawn on one canvas
 │   ├── host_dialog.py       # Add/Edit host dialog
 │   ├── import_dialog.py     # Pick hosts to import from the SSH config
-│   ├── log_panel.py         # Batched, thread-safe output log
+│   ├── log_panel.py         # Batched, thread-safe output log with level filter
 │   ├── code_editor.py       # YAML editor widget: gutter, highlighting, find
 │   ├── compose_editor.py    # Editor window: examples, checks, diff, save
 │   ├── stack_window.py      # Containers, actions, images, rollback, logs
 │   └── maintenance.py       # Disk usage and pruning
 ├── tools/
 │   └── gen_compose_docs.py  # Regenerates docs/compose-reference.md
-└── tests/                   # stdlib unittest; no dependencies required
+└── tests/                   # stdlib unittest; no extra dependencies required
 ```
 
 Run the tests with either runner:
@@ -249,7 +264,10 @@ python -m pytest
 python -m unittest discover -s tests -t .
 ```
 
-They need no host, no display, and no network. Three of them are guards on
+They need no host and no network. One module, `tests/test_host_list_widget.py`,
+builds the sidebar's host list for real — it is drawn and hit-tested by hand on
+a single canvas, so that is the only honest way to test it — in a window parked
+off-screen; without a display it is skipped. Three others are guards on
 things that drift silently rather than on behaviour:
 `tests/test_gen_compose_docs.py` fails if `docs/compose-reference.md` no longer
 matches the snippet library, and `tests/test_packaging.py` fails if
@@ -272,9 +290,9 @@ CI enforces a floor so the figure can only go up. Where the gaps are, and why:
 `core/` is well covered because none of it needs a display, and `core/compose.py`
 and `models/host.py` are effectively complete. The remainder is concentrated in
 two places — the parts of `core/ssh_client.py` that only run against a live host,
-and widget construction in `gui/`, where the tests deliberately cover the pure
-helpers and the lookup tables that have to agree with `core/` rather than
-instantiating windows.
+and widget construction in `gui/`, where — the host list aside — the tests
+deliberately cover the pure helpers and the lookup tables that have to agree
+with `core/` rather than instantiating windows.
 
 ## Building a Windows executable
 

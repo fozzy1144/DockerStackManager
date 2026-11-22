@@ -19,7 +19,11 @@ from core.ssh_config import (
     ImportCandidate,
     SSHConfigHost,
 )
-from gui import maintenance, stack_window
+import struct
+import zlib
+
+from gui import maintenance, stack_window, theme
+from gui.app import _host_colors, _source_label
 from gui.host_list import _update_summary, os_badge_color
 from gui.import_dialog import summarize
 from models.host import UPDATES_FAILED, UPDATES_UNKNOWN, Host
@@ -192,6 +196,150 @@ class TestMaintenanceOrder(unittest.TestCase):
         for name, (command, *_rest) in PRUNE_TARGETS.items():
             with self.subTest(name):
                 self.assertRegex(command, r"\s-\w*f")
+
+
+class TestDiskUsageParsing(unittest.TestCase):
+    """``gui.maintenance.parse_disk_usage`` turns ``docker system df`` into tiles."""
+
+    SAMPLE = (
+        "TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\n"
+        "Images          14        9         6.21GB    2.03GB (32%)\n"
+        "Containers      11        9         182MB     12MB (6%)\n"
+        "Local Volumes   8         6         3.4GB     410MB (12%)\n"
+        "Build Cache     41        0         1.1GB     1.1GB\n"
+    )
+
+    def test_every_row_is_read_in_order(self):
+        rows = maintenance.parse_disk_usage(self.SAMPLE)
+        self.assertEqual([r.kind for r in rows], ["Images", "Containers", "Volumes", "Build cache"])
+
+    def test_columns_land_in_the_right_fields(self):
+        images = maintenance.parse_disk_usage(self.SAMPLE)[0]
+        self.assertEqual(
+            (images.total, images.active, images.size, images.reclaimable),
+            ("14", "9", "6.21GB", "2.03GB (32%)"),
+        )
+
+    def test_reclaimable_without_a_percentage(self):
+        cache = maintenance.parse_disk_usage(self.SAMPLE)[3]
+        self.assertEqual(cache.reclaimable, "1.1GB")
+
+    def test_an_error_message_is_not_a_table(self):
+        # An empty result is the signal to show the message itself instead.
+        self.assertEqual(
+            maintenance.parse_disk_usage("permission denied while trying to connect"), []
+        )
+        self.assertEqual(maintenance.parse_disk_usage(""), [])
+
+
+class TestBulkIdentity(unittest.TestCase):
+    """The colour and name column that tell hosts apart during a bulk run."""
+
+    def test_neighbouring_hosts_get_different_colours(self):
+        hosts = [_host(label=f"h{i}") for i in range(len(theme.HOST_COLORS))]
+        colors = [_host_colors(hosts)[id(h)] for h in hosts]
+        self.assertEqual(len(set(colors)), len(hosts))
+
+    def test_colours_cycle_rather_than_run_out(self):
+        self.assertEqual(theme.host_color(len(theme.HOST_COLORS)), theme.host_color(0))
+
+    def test_a_host_keeps_its_colour_when_a_neighbour_sits_out(self):
+        # Keyed by position in the whole list, not among the hosts taking part.
+        hosts = [_host(label="a"), _host(label="b"), _host(label="c")]
+        before = _host_colors(hosts)[id(hosts[2])]
+        hosts[1].include_in_bulk = False
+        self.assertEqual(_host_colors(hosts)[id(hosts[2])], before)
+
+    def test_identity_colours_are_not_the_severity_colours(self):
+        # A host must never look like an error, a warning or a success.
+        severities = {theme.DANGER, theme.WARNING, theme.SUCCESS, theme.ORANGE}
+        self.assertFalse(severities & set(theme.HOST_COLORS))
+
+    def test_names_are_padded_to_one_column(self):
+        self.assertEqual(_source_label("pihole", 10), "pihole    ")
+
+    def test_long_names_are_cut_to_the_column(self):
+        label = _source_label("nas-archive-with-a-long-label", 12)
+        self.assertEqual(len(label), 12)
+        self.assertTrue(label.endswith("…"))
+
+
+class TestFitText(unittest.TestCase):
+    """Ellipsising text to a pixel width. Measured here at 10 px a character."""
+
+    @staticmethod
+    def _measure(text: str) -> int:
+        return 10 * len(text)
+
+    def test_text_that_fits_is_untouched(self):
+        self.assertEqual(theme.fit_text("docker-01", 90, self._measure), "docker-01")
+
+    def test_long_text_is_cut_to_the_longest_prefix_that_fits(self):
+        fitted = theme.fit_text("a-very-long-host-label", 100, self._measure)
+        self.assertEqual(fitted, "a-very-lo…")
+        self.assertLessEqual(self._measure(fitted), 100)
+
+    def test_no_space_is_left_before_the_ellipsis(self):
+        self.assertEqual(theme.fit_text("Debian GNU/Linux", 80, self._measure), "Debian…")
+
+    def test_no_room_at_all_still_returns_something(self):
+        self.assertEqual(theme.fit_text("docker-01", 5, self._measure), "…")
+
+    def test_an_unknown_width_leaves_the_text_alone(self):
+        # Before a widget is laid out its width is 0; cutting to that would blank it.
+        self.assertEqual(theme.fit_text("docker-01", 0, self._measure), "docker-01")
+
+
+class TestDrawnShapes(unittest.TestCase):
+    """The pixel maths behind the host list's rounded corners, switch and dots."""
+
+    @staticmethod
+    def _alpha(pixels: bytes, width: int, x: int, y: int) -> int:
+        return pixels[(y * width + x) * 4 + 3]
+
+    def test_a_circle_is_solid_in_the_middle_and_clear_at_the_corners(self):
+        pixels = theme.shape_pixels(12, 12, 6, "#3DD68C")
+        self.assertEqual(len(pixels), 12 * 12 * 4)
+        self.assertEqual(self._alpha(pixels, 12, 6, 6), 255)
+        self.assertEqual(self._alpha(pixels, 12, 0, 0), 0)
+        self.assertEqual(pixels[(6 * 12 + 6) * 4:(6 * 12 + 6) * 4 + 3], bytes((0x3D, 0xD6, 0x8C)))
+
+    def test_edges_are_anti_aliased(self):
+        pixels = theme.shape_pixels(12, 12, 6, "#FFFFFF")
+        partial = {a for a in pixels[3::4] if 0 < a < 255}
+        self.assertTrue(partial, "a circle with no partially covered pixels is aliased")
+
+    def test_shapes_are_symmetric_for_odd_and_even_sizes(self):
+        for width, height, radius in ((28, 15, 7.5), (9, 5, 2.5), (5, 5, 2.5), (3, 40, 1.5)):
+            pixels = theme.shape_pixels(width, height, radius, "#FFFFFF")
+            self.assertEqual(len(pixels), width * height * 4)
+            for y in range(height):
+                row = [self._alpha(pixels, width, x, y) for x in range(width)]
+                self.assertEqual(row, row[::-1])
+                self.assertEqual(
+                    row, [self._alpha(pixels, width, x, height - 1 - y) for x in range(width)]
+                )
+
+    def test_an_outline_is_hollow(self):
+        pixels = theme.shape_pixels(40, 20, 6, "#242933", outline=1)
+        self.assertEqual(self._alpha(pixels, 40, 20, 10), 0)
+        self.assertEqual(self._alpha(pixels, 40, 20, 0), 255)
+        self.assertEqual(self._alpha(pixels, 40, 0, 10), 255)
+
+    def test_alpha_scales_the_whole_shape(self):
+        pixels = theme.shape_pixels(10, 10, 5, "#FFFFFF", alpha=0.2)
+        self.assertEqual(max(pixels[3::4]), 51)
+
+    def test_png_round_trips(self):
+        rgba = bytes(range(24))  # 3 x 2 pixels
+        data = theme._png(3, 2, rgba)
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(struct.unpack(">II", data[16:24]), (3, 2))
+        start = data.index(b"IDAT") + 4
+        length = struct.unpack(">I", data[start - 8:start - 4])[0]
+        raw = zlib.decompress(data[start:start + length])
+        # Each scanline is a filter byte (0: none) followed by its pixels.
+        self.assertEqual(raw, b"\x00" + rgba[:12] + b"\x00" + rgba[12:])
 
 
 if __name__ == "__main__":

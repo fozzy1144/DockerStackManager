@@ -5,7 +5,9 @@ from typing import Optional
 
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
+
+from gui import theme
 
 MIN_PORT = 1
 MAX_PORT = 65535
@@ -52,12 +54,12 @@ class HostDialog(ctk.CTkToplevel):
         self.result: dict | None = None
         self._host = host
 
-        self.title("Edit Host" if host else "Add Host")
-        self.geometry("440x520")
+        self.title("Edit host" if host else "Add host")
         self.resizable(False, False)
+        self.transient(parent)
+        theme.present(self, parent, (480, 600),
+                      focus=lambda: (self._label if host else self._host_entry).focus_set())
         self.grab_set()
-        self.lift()
-        self.focus_force()
 
         self._build()
         if host:
@@ -68,50 +70,114 @@ class HostDialog(ctk.CTkToplevel):
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
     def _build(self):
-        pad = {"padx": 16, "pady": 4}
+        self.grid_columnconfigure(0, weight=1)
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.grid(row=0, column=0, sticky="nsew", padx=24, pady=(22, 0))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=0)
 
-        ctk.CTkLabel(self, text="Label (optional)").pack(anchor="w", **pad)
-        self._label = ctk.CTkEntry(self, placeholder_text="e.g. Media Server")
-        self._label.pack(fill="x", **pad)
+        theme.heading(body, "Edit host" if self._host else "Add a host", role="title").grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        theme.caption(
+            body,
+            "Connection details for a Linux machine you reach over SSH.",
+            role="small",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 16))
 
-        ctk.CTkLabel(self, text="Hostname / IP *").pack(anchor="w", **pad)
-        self._host_entry = ctk.CTkEntry(self, placeholder_text="192.168.1.10 or server.local")
-        self._host_entry.pack(fill="x", **pad)
+        self._label = self._field(body, 2, "Display name", "e.g. Media server", hint="optional")
 
-        ctk.CTkLabel(self, text="Port").pack(anchor="w", **pad)
-        self._port = ctk.CTkEntry(self, placeholder_text="22")
-        self._port.pack(fill="x", **pad)
+        # Hostname and port share a row: they are one address.
+        theme.text(body, "Hostname or IP", "small_strong", theme.TEXT_2).grid(
+            row=4, column=0, sticky="w", pady=(12, 4)
+        )
+        theme.text(body, "Port", "small_strong", theme.TEXT_2).grid(
+            row=4, column=1, sticky="w", pady=(12, 4), padx=(10, 0)
+        )
+        self._host_entry = self._entry(body, "192.168.1.10 or server.local")
+        self._host_entry.grid(row=5, column=0, sticky="ew")
+        self._port = self._entry(body, "22", width=90)
+        self._port.grid(row=5, column=1, sticky="ew", padx=(10, 0))
 
-        ctk.CTkLabel(self, text="Username *").pack(anchor="w", **pad)
-        self._user = ctk.CTkEntry(self, placeholder_text="root")
-        self._user.pack(fill="x", **pad)
+        self._user = self._field(body, 6, "Username", "root")
+
+        theme.divider(body).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(18, 4))
+        theme.overline(body, "Authentication").grid(
+            row=9, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
 
         # ── SSH Key ───────────────────────────────────────────────────────────
-        ctk.CTkLabel(self, text="SSH Key File (optional)").pack(anchor="w", **pad)
-        key_row = ctk.CTkFrame(self, fg_color="transparent")
-        key_row.pack(fill="x", padx=16, pady=4)
+        theme.text(body, "Private key file", "small_strong", theme.TEXT_2).grid(
+            row=10, column=0, columnspan=2, sticky="w", pady=(10, 4)
+        )
+        key_row = ctk.CTkFrame(body, fg_color="transparent")
+        key_row.grid(row=11, column=0, columnspan=2, sticky="ew")
         key_row.grid_columnconfigure(0, weight=1)
-
         self._key_var = tk.StringVar()
-        self._key_entry = ctk.CTkEntry(key_row, textvariable=self._key_var, placeholder_text="~/.ssh/id_rsa")
-        self._key_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        ctk.CTkButton(key_row, text="Browse", width=70, command=self._browse_key).grid(row=0, column=1)
+        self._key_entry = self._entry(key_row, "~/.ssh/id_ed25519", textvariable=self._key_var)
+        self._key_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        theme.button(key_row, "Browse…", self._browse_key, size="md").grid(row=0, column=1)
 
         # ── Password ─────────────────────────────────────────────────────────
-        self._pass_label = ctk.CTkLabel(self, text=self._password_hint())
-        self._pass_label.pack(anchor="w", **pad)
-        self._pass = ctk.CTkEntry(self, show="*", placeholder_text="password")
-        self._pass.pack(fill="x", **pad)
+        self._pass_label = theme.text(body, self._password_hint(), "small_strong", theme.TEXT_2)
+        self._pass_label.grid(row=12, column=0, columnspan=2, sticky="w", pady=(12, 4))
+        pass_row = ctk.CTkFrame(body, fg_color="transparent")
+        pass_row.grid(row=13, column=0, columnspan=2, sticky="ew")
+        pass_row.grid_columnconfigure(0, weight=1)
+        self._pass = self._entry(pass_row, "password", show="•")
+        self._pass.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._reveal = theme.button(pass_row, "Show", self._toggle_reveal, variant="ghost",
+                                    width=64)
+        self._reveal.grid(row=0, column=1)
+        theme.caption(
+            body, "Stored in the system credential manager, never on disk.", role="caption"
+        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # Whether a password is required depends on whether a key is set, so the
         # hint has to follow the key field as it is typed or browsed to.
         self._key_var.trace_add("write", self._on_key_changed)
 
-        # ── Buttons ───────────────────────────────────────────────────────────
+        # ── Error + buttons ───────────────────────────────────────────────────
+        self._error = theme.caption(self, "", color=theme.DANGER, role="small", wraplength=430)
+        self._error.grid(row=1, column=0, sticky="ew", padx=24, pady=(14, 0))
+
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=16, pady=14)
-        ctk.CTkButton(btn_frame, text="Cancel", fg_color="gray40", command=self._cancel).pack(side="right", padx=4)
-        ctk.CTkButton(btn_frame, text="Save", command=self._save).pack(side="right")
+        btn_frame.grid(row=2, column=0, sticky="ew", padx=24, pady=(10, 22))
+        theme.button(btn_frame, "Save host" if not self._host else "Save changes",
+                     self._save, variant="primary").pack(side="right")
+        theme.button(btn_frame, "Cancel", self._cancel, variant="ghost").pack(
+            side="right", padx=(0, 8)
+        )
+
+    def _field(self, parent, row: int, label: str, placeholder: str, hint: str = ""):
+        heading = ctk.CTkFrame(parent, fg_color="transparent")
+        heading.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(12, 4))
+        theme.text(heading, label, "small_strong", theme.TEXT_2).pack(side="left")
+        if hint:
+            theme.caption(heading, hint).pack(side="left", padx=(6, 0))
+        entry = self._entry(parent, placeholder)
+        entry.grid(row=row + 1, column=0, columnspan=2, sticky="ew")
+        return entry
+
+    @staticmethod
+    def _entry(parent, placeholder: str, **kwargs) -> ctk.CTkEntry:
+        options = dict(placeholder_text=placeholder, height=36, font=theme.font("body"))
+        options.update(kwargs)
+        return ctk.CTkEntry(parent, **options)
+
+    def _toggle_reveal(self):
+        hidden = self._pass.cget("show") != ""
+        self._pass.configure(show="" if hidden else "•")
+        self._reveal.configure(text="Hide" if hidden else "Show")
+
+    def _fail(self, message: str, field=None) -> None:
+        """Show a validation problem in place, and put the cursor where it is."""
+        self._error.configure(text=message)
+        for entry in (self._host_entry, self._user, self._port, self._key_entry, self._pass):
+            entry.configure(border_color=theme.BORDER_STRONG)
+        if field is not None:
+            field.configure(border_color=theme.DANGER)
+            field.focus_set()
 
     def _password_hint(self) -> str:
         """Label for the password field, which means different things per mode."""
@@ -153,29 +219,27 @@ class HostDialog(ctk.CTkToplevel):
         port_str = self._port.get().strip() or "22"
 
         if not hostname:
-            messagebox.showerror("Validation", "Hostname is required.", parent=self)
+            self._fail("Enter the host's name or IP address.", self._host_entry)
             return
+
+        port = parse_port(port_str)
+        if port is None:
+            self._fail(f"Port must be a whole number between {MIN_PORT} and {MAX_PORT}.",
+                       self._port)
+            return
+
         if not username:
-            messagebox.showerror("Validation", "Username is required.", parent=self)
+            self._fail("Enter the user to log in as.", self._user)
             return
 
         # Need either a key or a password (new hosts must supply one; edits may keep existing)
         adding_new = self._host is None
         if adding_new and not key_path and not password:
-            messagebox.showerror("Validation", "Provide a password or an SSH key file.", parent=self)
+            self._fail("Add a password or choose a private key file.", self._pass)
             return
 
         if key_path and not os.path.isfile(key_path):
-            messagebox.showerror("Validation", f"Key file not found:\n{key_path}", parent=self)
-            return
-
-        port = parse_port(port_str)
-        if port is None:
-            messagebox.showerror(
-                "Validation",
-                f"Port must be a whole number between {MIN_PORT} and {MAX_PORT}.",
-                parent=self,
-            )
+            self._fail(f"No key file at {key_path}", self._key_entry)
             return
 
         self.result = {

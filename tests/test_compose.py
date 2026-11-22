@@ -332,6 +332,10 @@ class TestFindingLines(unittest.TestCase):
             compose._line_of_key("ports:\n  - target: 80\n", "target"), 2
         )
 
+    def test_line_of_key_after_a_blank_line(self):
+        # The indent before a key must not swallow the blank line above it.
+        self.assertEqual(compose._line_of_key("a:\n  x: 1\n\n  redis:\n", "redis"), 4)
+
     def test_line_of_key_with_no_match_returns_the_starting_point(self):
         self.assertEqual(compose._line_of_key("a: 1\n", "nope", after=7), 7)
 

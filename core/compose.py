@@ -546,7 +546,9 @@ def _line_of_key(text: str, key: str, after: int = 0) -> int:
     """
     if not key:
         return 0
-    pattern = re.compile(rf"^\s*(?:-\s*)?{re.escape(key)}\s*:", re.MULTILINE)
+    # Blanks and tabs, not \s: \s also matches newlines, which let a match begin
+    # on the blank line above the key and report the finding one line early.
+    pattern = re.compile(rf"^[ \t]*(?:-[ \t]*)?{re.escape(key)}[ \t]*:", re.MULTILINE)
     lines = text.splitlines()
     start_offset = 0
     if after > 1:

@@ -13,23 +13,17 @@ Neither one blocks a determined save; both make you acknowledge what you are
 doing first.
 """
 
-import threading
 import time
 import tkinter as tk
-from tkinter import messagebox
 from typing import Callable, Optional
 
 import customtkinter as ctk
 
 from core import compose, snippets
 from core.ssh_client import SSHClient
+from gui import dialogs, theme
 from gui.code_editor import CodeEditor
-from gui.theme import (
-    ACCENT_PURPLE,
-    ACCENT_PURPLE_HOVER,
-    LEVEL_ACCENTS,
-    SELECTED,
-)
+from gui.theme import LEVEL_ACCENTS
 from models.host import DockerStack
 
 _LEVEL_ICONS = {compose.ERROR: "✕", compose.WARNING: "▲", compose.INFO: "i"}
@@ -70,21 +64,15 @@ class ComposeEditor(ctk.CTkToplevel):
         self._last_status: tuple[str, str] = ("", "")
         self._sticky_until = 0.0
 
-        self.title(f"Compose Editor — {stack.name}")
-        self.geometry("1500x900")
-        self.minsize(1100, 640)
+        self.title(f"{stack.name} — Compose Editor")
+        theme.present(self, parent, (1440, 900), minsize=(1100, 660),
+                      focus=lambda: self._editor.text.focus_set())
 
         self._build()
         self._bind_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self._close)
 
         self.after(80, self._load)
-        self.after(120, self._focus_window)
-
-    def _focus_window(self) -> None:
-        self.lift()
-        self.focus_force()
-        self._editor.text.focus_set()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Layout
@@ -97,10 +85,10 @@ class ComposeEditor(ctk.CTkToplevel):
         self._build_toolbar()
 
         self._snippet_panel = _SnippetBrowser(self, on_insert=self._insert_snippet)
-        self._snippet_panel.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=4)
+        self._snippet_panel.grid(row=1, column=0, sticky="nsew", padx=(16, 6), pady=(0, 12))
 
         right = ctk.CTkFrame(self, fg_color="transparent")
-        right.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=4)
+        right.grid(row=1, column=1, sticky="nsew", padx=(6, 16), pady=(0, 12))
         right.grid_rowconfigure(1, weight=1)
         right.grid_columnconfigure(0, weight=1)
 
@@ -111,12 +99,18 @@ class ComposeEditor(ctk.CTkToplevel):
         self._editor.grid(row=1, column=0, sticky="nsew")
 
         self._findings_panel = _FindingsPanel(right, on_select=self._goto_finding)
-        self._findings_panel.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self._findings_panel.grid(row=2, column=0, sticky="ew", pady=(10, 0))
 
-        self._status = ctk.CTkLabel(
-            self, text="Loading…", anchor="w", font=ctk.CTkFont(size=11)
-        )
-        self._status.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 6))
+        # Status bar: a full-width strip under a hairline, like any editor.
+        theme.divider(self).grid(row=2, column=0, columnspan=2, sticky="ew")
+        strip = ctk.CTkFrame(self, fg_color=theme.SIDEBAR, corner_radius=0, height=30)
+        strip.grid(row=3, column=0, columnspan=2, sticky="ew")
+        strip.grid_columnconfigure(0, weight=1)
+        self._status = theme.caption(strip, "Loading…", role="caption", color=theme.TEXT_2)
+        self._status.grid(row=0, column=0, sticky="w", padx=16, pady=6)
+        theme.caption(
+            strip, "Ctrl+S save   ·   Ctrl+F find   ·   F5 validate", color=theme.TEXT_3
+        ).grid(row=0, column=1, sticky="e", padx=16)
 
     def _editor_ref(self) -> CodeEditor:
         """Late-bound accessor — the find bar is built before the editor exists."""
@@ -124,37 +118,38 @@ class ComposeEditor(ctk.CTkToplevel):
 
     def _build_toolbar(self) -> None:
         bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 0))
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(16, 12))
+        bar.grid_columnconfigure(0, weight=1)
 
-        self._path_label = ctk.CTkLabel(
-            bar,
-            text=self._stack.compose_file,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            anchor="w",
-        )
-        self._path_label.pack(side="left", padx=(4, 12))
+        title = ctk.CTkFrame(bar, fg_color="transparent")
+        title.grid(row=0, column=0, sticky="w")
+        theme.overline(title, f"{self._stack.name}  ·  compose file").pack(anchor="w")
+        path_row = ctk.CTkFrame(title, fg_color="transparent")
+        path_row.pack(anchor="w", pady=(2, 0))
+        self._path_label = theme.text(path_row, self._stack.compose_file, "mono", theme.TEXT)
+        self._path_label.pack(side="left")
+        self._dirty_pill = theme.pill(path_row, "", theme.WARNING, base=theme.BG, dot=False)
+        self._dirty_pill.pack(side="left", padx=(10, 0))
 
         buttons = ctk.CTkFrame(bar, fg_color="transparent")
-        buttons.pack(side="right")
+        buttons.grid(row=0, column=1, sticky="e")
 
-        def add(text: str, command, width: int = 92, **kwargs) -> ctk.CTkButton:
-            button = ctk.CTkButton(
-                buttons, text=text, width=width, height=28, command=command, **kwargs
-            )
-            button.pack(side="left", padx=3)
+        def add(text: str, command, variant: str = "secondary", tip: str = "",
+                gap: int = 6) -> ctk.CTkButton:
+            button = theme.button(buttons, text, command, variant=variant)
+            button.pack(side="left", padx=(0, gap))
+            if tip:
+                theme.Tooltip(button, tip)
             return button
 
-        self._btn_reload = add("Reload", self._reload, 74)
-        self._btn_find = add("Find", self._show_find, 62)
-        self._btn_diff = add("Diff", self._show_diff, 62)
-        self._btn_validate = add("Validate", self._validate, 84)
-        self._btn_save = add("Save", self._save, 74)
+        self._btn_reload = add("Reload", self._reload, "ghost", "Re-read the file from the host", 2)
+        self._btn_find = add("Find", self._show_find, "ghost", "Find and replace  (Ctrl+F)", 10)
+        self._btn_diff = add("Diff", self._show_diff, tip="Compare with what is on the host")
+        self._btn_validate = add("Validate", self._validate, tip="docker compose config  (F5)")
+        self._btn_save = add("Save", self._save, tip="Validate, back up, and write  (Ctrl+S)")
         self._btn_deploy = add(
-            "Save & Deploy",
-            self._save_and_deploy,
-            118,
-            fg_color=ACCENT_PURPLE,
-            hover_color=ACCENT_PURPLE_HOVER,
+            "Save & deploy", self._save_and_deploy, "primary",
+            "Save, then docker compose up -d", 0,
         )
 
     def _bind_shortcuts(self) -> None:
@@ -179,14 +174,14 @@ class ComposeEditor(ctk.CTkToplevel):
             content, error = self._ssh.read_text(self._stack.compose_file)
             self.after(0, lambda: self._on_loaded(content, error))
 
-        _in_thread(task)
+        theme.run_in_thread(task)
 
     def _on_loaded(self, content: Optional[str], error: str) -> None:
         self._set_busy(False)
         if content is None:
             self._set_status(f"Could not read the file: {error}", compose.ERROR)
-            messagebox.showerror(
-                "Could not read file",
+            dialogs.showerror(
+                "Could not read the file",
                 f"{self._stack.compose_file}\n\n{error}",
                 parent=self,
             )
@@ -194,13 +189,14 @@ class ComposeEditor(ctk.CTkToplevel):
         self._original = content
         self._editor.set_text(content)
         self._run_lint()
+        self._update_dirty()
         self._set_status("Loaded.")
 
     def _reload(self) -> None:
-        if self._editor.modified and not messagebox.askyesno(
-            "Discard changes?",
-            "Re-reading the file from the host will discard your edits.\n\nContinue?",
-            parent=self,
+        if self._editor.modified and not dialogs.askyesno(
+            "Discard your edits?",
+            "Re-reading the file from the host replaces everything in the editor.",
+            parent=self, confirm="Discard and reload", tone="danger",
         ):
             return
         self._load()
@@ -221,11 +217,10 @@ class ComposeEditor(ctk.CTkToplevel):
             return
 
         errors = [f for f in self._findings if f.is_error]
-        if errors and not messagebox.askyesno(
+        if errors and not dialogs.askyesno(
             "Save with errors?",
-            f"The file has {len(errors)} error(s), starting with:\n\n"
-            f"{errors[0]}\n\nSave it anyway?",
-            parent=self,
+            f"The checks found {len(errors)} error(s). The first is:\n\n{errors[0]}",
+            parent=self, confirm="Save anyway", tone="warning",
         ):
             return
 
@@ -236,14 +231,15 @@ class ComposeEditor(ctk.CTkToplevel):
             ok, message = self._ssh.validate_compose(self._stack, text)
             self.after(0, lambda: self._after_validate(ok, message, deploy))
 
-        _in_thread(task)
+        theme.run_in_thread(task)
 
     def _after_validate(self, ok: bool, message: str, deploy: bool) -> None:
         self._set_busy(False)
-        if not ok and not messagebox.askyesno(
+        if not ok and not dialogs.askyesno(
             "Docker rejected the file",
-            f"{message}\n\nSave it anyway?",
-            parent=self,
+            f"docker compose config failed on the host. Saving anyway may leave the "
+            f"stack unable to start.\n\n{message}",
+            parent=self, confirm="Save anyway", tone="warning",
         ):
             self._set_status(f"Not saved — {_first_line(message)}", compose.ERROR, sticky=True)
             return
@@ -255,21 +251,24 @@ class ComposeEditor(ctk.CTkToplevel):
             saved, detail = self._ssh.write_text(self._stack.compose_file, text)
             self.after(0, lambda: self._after_save(saved, detail, deploy, text))
 
-        _in_thread(task)
+        theme.run_in_thread(task)
 
     def _after_save(self, saved: bool, detail: str, deploy: bool, text: str) -> None:
         self._set_busy(False)
         if not saved:
             self._set_status(f"Save failed: {detail}", compose.ERROR, sticky=True)
             self._log(f"{self._stack.name}: save failed — {detail}", "error")
-            messagebox.showerror("Save failed", detail, parent=self)
+            dialogs.showerror("Save failed", detail, parent=self)
             return
 
         self._original = text
         self._editor.mark_clean()
+        self._update_dirty()
         backup_note = f" Backup: {detail}" if detail else ""
         self._set_status(f"Saved.{backup_note}", "saved", sticky=True)
         self._log(f"{self._stack.name}: compose file saved.{backup_note}", "success")
+        if not deploy:
+            dialogs.toast(self, "Saved to host", detail=detail and f"Backup: {detail}")
 
         if deploy:
             self._deploy()
@@ -282,7 +281,7 @@ class ComposeEditor(ctk.CTkToplevel):
             ok = self._ssh.compose_action(self._stack, "up", self._log)
             self.after(0, lambda: self._after_deploy(ok))
 
-        _in_thread(task)
+        theme.run_in_thread(task)
 
     def _after_deploy(self, ok: bool) -> None:
         self._set_busy(False)
@@ -291,6 +290,9 @@ class ComposeEditor(ctk.CTkToplevel):
             "saved" if ok else compose.ERROR,
             sticky=True,
         )
+        dialogs.toast(self, "Deployed" if ok else "Deploy failed",
+                      "success" if ok else "error",
+                      detail="" if ok else "See the main window's activity log.")
         if ok and self._on_deployed is not None:
             self._on_deployed()
 
@@ -305,7 +307,7 @@ class ComposeEditor(ctk.CTkToplevel):
             ok, message = self._ssh.validate_compose(self._stack, text)
             self.after(0, lambda: self._on_validated(ok, message))
 
-        _in_thread(task)
+        theme.run_in_thread(task)
 
     def _on_validated(self, ok: bool, message: str) -> None:
         self._set_busy(False)
@@ -313,13 +315,18 @@ class ComposeEditor(ctk.CTkToplevel):
             self._set_status(f"Docker accepted the file. {compose.summarize(self._findings)}", "saved", sticky=True)
         else:
             self._set_status(f"Docker rejected it: {_first_line(message)}", compose.ERROR, sticky=True)
-            messagebox.showwarning("Validation failed", message, parent=self)
+            dialogs.showwarning(
+                "Docker rejected the file",
+                f"docker compose config reported a problem.\n\n{message}",
+                parent=self,
+            )
 
     # ──────────────────────────────────────────────────────────────────────────
     # Linting
     # ──────────────────────────────────────────────────────────────────────────
 
     def _on_edit(self) -> None:
+        self._update_dirty()
         self._update_status_position()
         if self._lint_job is not None:
             try:
@@ -393,9 +400,8 @@ class ComposeEditor(ctk.CTkToplevel):
             self._original, self._editor.get_text(), self._stack.compose_file
         )
         if not patch:
-            messagebox.showinfo(
-                "No changes", "The file matches what is on the host.", parent=self
-            )
+            dialogs.toast(self, "No changes", "info",
+                          detail="The editor matches the file on the host.")
             return
         _DiffWindow(self, patch)
 
@@ -418,15 +424,25 @@ class ComposeEditor(ctk.CTkToplevel):
         if message:
             self._set_status(message)
 
+    def _update_dirty(self) -> None:
+        """The "Unsaved" chip beside the path, and an asterisk in the title."""
+        dirty = self._editor.modified
+        if dirty == getattr(self, "_dirty_shown", None):
+            return
+        self._dirty_shown = dirty
+        theme.set_pill(self._dirty_pill, "Unsaved" if dirty else "", theme.WARNING,
+                       base=theme.BG, dot=False)
+        prefix = "● " if dirty else ""
+        self.title(f"{prefix}{self._stack.name} — Compose Editor")
+
     def _update_status_position(self) -> None:
         """Show cursor position and the lint summary — the idle state of the bar."""
         if self._busy or time.monotonic() < self._sticky_until:
             return
         line, column = self._editor.cursor_position()
-        marker = " • modified" if self._editor.modified else ""
         self._set_status(
-            f"Ln {line}, Col {column}   |   {self._editor.line_count()} lines"
-            f"   |   {compose.summarize(self._findings)}{marker}"
+            f"Ln {line}, Col {column}     {self._editor.line_count()} lines"
+            f"     {compose.summarize(self._findings)}"
         )
 
     def _set_status(self, message: str, level: str = "", sticky: bool = False) -> None:
@@ -444,7 +460,7 @@ class ComposeEditor(ctk.CTkToplevel):
             return
         self._last_status = (message, level)
         self._status.configure(
-            text=message, text_color=LEVEL_ACCENTS.get(level, "gray70")
+            text=message, text_color=LEVEL_ACCENTS.get(level, theme.TEXT_2)
         )
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -453,16 +469,16 @@ class ComposeEditor(ctk.CTkToplevel):
 
     def _close(self) -> None:
         if self._busy:
-            if not messagebox.askyesno(
+            if not dialogs.askyesno(
                 "Still working",
-                "An operation is still running. Close anyway?",
-                parent=self,
+                "An operation is still running. Closing now will not stop it on the host.",
+                parent=self, confirm="Close anyway", tone="warning",
             ):
                 return
-        elif self._editor.modified and not messagebox.askyesno(
-            "Discard changes?",
-            "The file has unsaved changes.\n\nClose without saving?",
-            parent=self,
+        elif self._editor.modified and not dialogs.askyesno(
+            "Close without saving?",
+            "Your edits to this compose file have not been saved to the host.",
+            parent=self, confirm="Discard edits", tone="danger",
         ):
             return
         self.destroy()
@@ -472,48 +488,66 @@ class _SnippetBrowser(ctk.CTkFrame):
     """Category list of example configurations, with their customization notes."""
 
     def __init__(self, parent, on_insert: Callable[[snippets.Snippet], None]):
-        super().__init__(parent, width=330)
+        super().__init__(parent, width=340, fg_color=theme.SURFACE, corner_radius=12,
+                         border_width=1, border_color=theme.BORDER)
         self._on_insert = on_insert
         self._grouped = snippets.by_category()
         self._selected: Optional[snippets.Snippet] = None
         self._buttons: dict[str, ctk.CTkButton] = {}
 
         self.grid_propagate(False)
-        self.grid_rowconfigure(2, weight=1)
-        self.grid_rowconfigure(4, weight=2)
+        self.grid_rowconfigure(2, weight=2)
+        self.grid_rowconfigure(4, weight=3)
         self.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
-            self, text="Examples", font=ctk.CTkFont(size=14, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        theme.heading(self, "Examples", role="heading").grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 8)
+        )
 
         self._category = ctk.CTkOptionMenu(
             self,
             values=list(self._grouped),
             command=self._on_category_changed,
+            height=32,
+            font=theme.font("small_strong"),
+            dropdown_font=theme.font("small"),
         )
-        self._category.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        self._category.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
 
-        self._list = ctk.CTkScrollableFrame(self, label_text="")
-        self._list.grid(row=2, column=0, sticky="nsew", padx=10)
+        self._list = theme.scrollable(self, height=120)
+        self._list.grid(row=2, column=0, sticky="nsew", padx=(8, 4))
         self._list.grid_columnconfigure(0, weight=1)
 
-        self._insert_button = ctk.CTkButton(
-            self, text="Insert at cursor", command=self._insert, state="disabled"
+        self._insert_button = theme.button(
+            self, "Insert at cursor", self._insert, variant="primary", state="disabled"
         )
-        self._insert_button.grid(row=3, column=0, sticky="ew", padx=10, pady=6)
+        self._insert_button.grid(row=3, column=0, sticky="ew", padx=12, pady=10)
 
         self._details = ctk.CTkTextbox(
-            self, state="disabled", wrap="word", font=("Segoe UI", 11)
+            self, state="disabled", wrap="word", font=(theme.UI_FAMILY, 12),
+            fg_color=theme.INSET, border_spacing=10, height=120,
         )
-        self._details.grid(row=4, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        self._details.grid(row=4, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        theme.style_textbox(self._details)
+        self._details.tag_config("summary", foreground=theme.TEXT, spacing3=8)
+        # CTkTextbox refuses per-tag fonts; the underlying Tk widget does not.
+        self._details._textbox.tag_config("code", foreground="#9CDCFE",
+                                          font=theme.scaled_mono(self, 11), lmargin1=8, lmargin2=8)
+        self._details.tag_config("notes", foreground=theme.TEXT_2, spacing1=2)
+        self._details.tag_config("link", foreground=theme.ACCENT_TEXT)
+        self._details.tag_config("rule", foreground=theme.BORDER_STRONG)
 
         first = next(iter(self._grouped), "")
         if first:
             self._on_category_changed(first)
+        self._show_hint()
 
     def set_services(self, _services: list[str]) -> None:
         """Hook for future service-aware suggestions; currently informational."""
+
+    def _show_hint(self) -> None:
+        self._write([("Pick an example to see what it does, the YAML it inserts, "
+                      "and what to change before using it.", "notes")])
 
     def _on_category_changed(self, category: str) -> None:
         for widget in self._list.winfo_children():
@@ -526,37 +560,43 @@ class _SnippetBrowser(ctk.CTkFrame):
                 text=snippet.title,
                 anchor="w",
                 height=30,
+                corner_radius=7,
                 fg_color="transparent",
-                text_color="gray85",
-                hover_color="#2B5278",
+                text_color=theme.TEXT_2,
+                hover_color=theme.SURFACE_3,
+                font=theme.font("small"),
                 command=lambda s=snippet: self._select(s),
             )
-            button.pack(fill="x", pady=1)
+            button.pack(fill="x", pady=1, padx=(0, 4))
             self._buttons[snippet.title] = button
 
     def _select(self, snippet: snippets.Snippet) -> None:
         self._selected = snippet
         self._insert_button.configure(state="normal")
+        selected_bg = theme.tint(theme.ACCENT, 0.20, theme.SURFACE)
         for title, button in self._buttons.items():
+            active = title == snippet.title
             button.configure(
-                fg_color=SELECTED if title == snippet.title else "transparent"
+                fg_color=selected_bg if active else "transparent",
+                text_color=theme.TEXT if active else theme.TEXT_2,
+                hover_color=selected_bg if active else theme.SURFACE_3,
             )
 
-        body = [
-            snippet.summary,
-            "",
-            snippet.body.rstrip(),
-            "",
-            "─" * 44,
-            "",
-            snippet.details.strip(),
+        parts = [
+            (snippet.summary + "\n", "summary"),
+            (snippet.body.rstrip() + "\n", "code"),
+            ("\n" + "─" * 36 + "\n\n", "rule"),
+            (snippet.details.strip() + "\n", "notes"),
         ]
         if snippet.docs_url:
-            body += ["", f"Reference: {snippet.docs_url}"]
+            parts.append((f"\nReference: {snippet.docs_url}", "link"))
+        self._write(parts)
 
+    def _write(self, parts: list[tuple[str, str]]) -> None:
         self._details.configure(state="normal")
         self._details.delete("1.0", "end")
-        self._details.insert("1.0", "\n".join(body))
+        for text, tag in parts:
+            self._details.insert("end", text, tag)
         self._details.configure(state="disabled")
 
     def _insert(self) -> None:
@@ -570,32 +610,27 @@ class _FindingsPanel(ctk.CTkFrame):
     _MAX_ROWS = 60
 
     def __init__(self, parent, on_select: Callable[[compose.Finding], None]):
-        super().__init__(parent, height=150)
+        super().__init__(parent, height=168, fg_color=theme.SURFACE, corner_radius=12,
+                         border_width=1, border_color=theme.BORDER)
         self._on_select = on_select
 
         self.grid_propagate(False)
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        self._header = ctk.CTkLabel(
-            self, text="Checks", font=ctk.CTkFont(size=12, weight="bold"), anchor="w"
-        )
-        self._header.grid(row=0, column=0, sticky="w", padx=10, pady=(6, 2))
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(10, 4))
+        theme.heading(head, "Checks", role="heading").pack(side="left")
+        self._header = theme.pill(head, "", theme.TEXT_3, base=theme.SURFACE, dot=False)
+        self._header.pack(side="left", padx=(10, 0))
 
-        self._rows = ctk.CTkScrollableFrame(self, label_text="")
-        self._rows.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 2))
+        self._rows = theme.scrollable(self, height=60)
+        self._rows.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=(0, 2))
         self._rows.grid_columnconfigure(0, weight=1)
 
-        self._hint = ctk.CTkLabel(
-            self,
-            text="",
-            font=ctk.CTkFont(size=11),
-            text_color="gray70",
-            anchor="w",
-            justify="left",
-            wraplength=900,
-        )
-        self._hint.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
+        self._hint = theme.caption(self, "", role="small", color=theme.TEXT_2,
+                                   wraplength=900)
+        self._hint.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
 
     def show(self, findings: list[compose.Finding]) -> None:
         for widget in self._rows.winfo_children():
@@ -603,37 +638,40 @@ class _FindingsPanel(ctk.CTkFrame):
         self._hint.configure(text="")
 
         if not findings:
-            self._header.configure(text="Checks — no issues found")
-            ctk.CTkLabel(
-                self._rows, text="Nothing to report.", text_color="#4CAF50", anchor="w"
-            ).pack(fill="x", padx=4, pady=2)
+            theme.set_pill(self._header, "No issues", theme.SUCCESS, base=theme.SURFACE)
+            theme.caption(
+                self._rows, "✓  Nothing to report.", color=theme.SUCCESS, role="small"
+            ).pack(fill="x", padx=8, pady=4)
             return
 
-        self._header.configure(text=f"Checks — {compose.summarize(findings)}")
+        worst = (compose.ERROR if any(f.is_error for f in findings)
+                 else compose.WARNING if any(f.level == compose.WARNING for f in findings)
+                 else compose.INFO)
+        theme.set_pill(self._header, compose.summarize(findings),
+                       LEVEL_ACCENTS.get(worst, theme.TEXT_2), base=theme.SURFACE, dot=False)
         for finding in findings[: self._MAX_ROWS]:
             self._add_row(finding)
         if len(findings) > self._MAX_ROWS:
-            ctk.CTkLabel(
-                self._rows,
-                text=f"…and {len(findings) - self._MAX_ROWS} more.",
-                text_color="gray60",
-                anchor="w",
-            ).pack(fill="x", padx=4)
+            theme.caption(
+                self._rows, f"…and {len(findings) - self._MAX_ROWS} more.", role="small"
+            ).pack(fill="x", padx=8)
 
     def _add_row(self, finding: compose.Finding) -> None:
         location = f"line {finding.line}" if finding.line else "file"
+        color = LEVEL_ACCENTS.get(finding.level, theme.TEXT_2)
         row = ctk.CTkButton(
             self._rows,
-            text=f"{_LEVEL_ICONS.get(finding.level, '•')}  {location}  —  {finding.message}",
+            text=f"{_LEVEL_ICONS.get(finding.level, '•')}   {location:<9}  {finding.message}",
             anchor="w",
-            height=24,
+            height=26,
+            corner_radius=6,
             fg_color="transparent",
-            hover_color="#2B5278",
-            text_color=LEVEL_ACCENTS.get(finding.level, "gray80"),
-            font=ctk.CTkFont(size=11),
+            hover_color=theme.SURFACE_3,
+            text_color=color,
+            font=theme.font("small"),
             command=lambda: self._select(finding),
         )
-        row.pack(fill="x", pady=1)
+        row.pack(fill="x", pady=0, padx=(0, 4))
 
     def _select(self, finding: compose.Finding) -> None:
         self._hint.configure(text=finding.hint or finding.message)
@@ -644,43 +682,43 @@ class _FindBar(ctk.CTkFrame):
     """Find and replace strip above the editor."""
 
     def __init__(self, parent, editor: Callable[[], CodeEditor], on_close: Callable[[], None]):
-        super().__init__(parent, fg_color="#2A2A2A", corner_radius=6)
+        super().__init__(parent, fg_color=theme.SURFACE, corner_radius=10,
+                         border_width=1, border_color=theme.BORDER_STRONG)
         self._editor = editor
         self._case = tk.BooleanVar(value=False)
 
-        self._find = ctk.CTkEntry(self, placeholder_text="Find", width=220, height=26)
-        self._find.pack(side="left", padx=(8, 4), pady=6)
+        self._find = ctk.CTkEntry(self, placeholder_text="Find", width=220, height=28,
+                                  font=theme.font("small"))
+        self._find.pack(side="left", padx=(8, 4), pady=8)
         self._find.bind("<Return>", lambda _e: self._next())
         self._find.bind("<KeyRelease>", lambda _e: self._refresh_matches())
 
         self._replace = ctk.CTkEntry(
-            self, placeholder_text="Replace with", width=200, height=26
+            self, placeholder_text="Replace with", width=200, height=28,
+            font=theme.font("small"),
         )
-        self._replace.pack(side="left", padx=4, pady=6)
+        self._replace.pack(side="left", padx=4, pady=8)
 
-        for text, command, width in (
-            ("▲", self._previous, 34),
-            ("▼", self._next, 34),
-            ("Replace", self._replace_one, 78),
-            ("All", self._replace_all, 50),
+        for text, command, variant, tip in (
+            ("↑", self._previous, "ghost", "Previous match"),
+            ("↓", self._next, "ghost", "Next match  (Enter)"),
+            ("Replace", self._replace_one, "secondary", ""),
+            ("All", self._replace_all, "secondary", "Replace all"),
         ):
-            ctk.CTkButton(
-                self, text=text, width=width, height=26, command=command
-            ).pack(side="left", padx=2, pady=6)
+            button = theme.button(self, text, command, variant=variant, size="sm")
+            button.pack(side="left", padx=2, pady=8)
+            if tip:
+                theme.Tooltip(button, tip)
 
         ctk.CTkCheckBox(
-            self, text="Aa", variable=self._case, width=44,
-            command=self._refresh_matches,
-        ).pack(side="left", padx=6)
+            self, text="Match case", variable=self._case, width=44, font=theme.font("small"),
+            checkbox_width=16, checkbox_height=16, command=self._refresh_matches,
+        ).pack(side="left", padx=(10, 6))
 
-        self._count = ctk.CTkLabel(
-            self, text="", font=ctk.CTkFont(size=11), text_color="gray70", width=90
-        )
+        self._count = theme.caption(self, "", role="small", width=90)
         self._count.pack(side="left", padx=4)
 
-        ctk.CTkButton(self, text="✕", width=28, height=26, command=on_close).pack(
-            side="right", padx=8
-        )
+        theme.icon_button(self, "✕", on_close, size=26).pack(side="right", padx=8)
 
     def focus_entry(self) -> None:
         self._find.focus_set()
@@ -722,14 +760,32 @@ class _DiffWindow(ctk.CTkToplevel):
     def __init__(self, parent, patch: str):
         super().__init__(parent)
         self.title("Changes to be saved")
-        self.geometry("980x620")
+        theme.present(self, parent, (1000, 640))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
 
-        text = ctk.CTkTextbox(self, font=("Consolas", 12), wrap="none")
-        text.pack(fill="both", expand=True, padx=10, pady=10)
+        added = sum(1 for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in patch.splitlines() if l.startswith("-") and not l.startswith("---"))
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 10))
+        theme.heading(head, "Changes to be saved", role="title").pack(side="left")
+        theme.pill(head, f"+{added}", theme.SUCCESS, base=theme.BG, dot=False).pack(
+            side="left", padx=(12, 4))
+        theme.pill(head, f"−{removed}", theme.DANGER, base=theme.BG, dot=False).pack(side="left")
+        theme.button(head, "Close", self.destroy, variant="secondary", size="sm").pack(side="right")
 
-        text.tag_config("added", foreground="#7EE787")
-        text.tag_config("removed", foreground="#FF7B72")
-        text.tag_config("header", foreground="#79C0FF")
+        text = ctk.CTkTextbox(self, font=theme.mono_tuple(12), wrap="none",
+                              fg_color=theme.INSET, border_spacing=8, corner_radius=10,
+                              border_width=1, border_color=theme.BORDER)
+        text.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        theme.style_textbox(text)
+
+        text.tag_config("added", foreground="#7EE787",
+                        background=theme.tint(theme.SUCCESS, 0.10, theme.INSET))
+        text.tag_config("removed", foreground="#FF8E8A",
+                        background=theme.tint(theme.DANGER, 0.10, theme.INSET))
+        text.tag_config("header", foreground=theme.INFO)
+        text.tag_config("context", foreground=theme.TEXT_2)
 
         for line in patch.splitlines(keepends=True):
             if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
@@ -739,14 +795,11 @@ class _DiffWindow(ctk.CTkToplevel):
             elif line.startswith("-"):
                 tag = "removed"
             else:
-                tag = ""
+                tag = "context"
             text.insert("end", line, tag)
         text.configure(state="disabled")
 
-        ctk.CTkButton(self, text="Close", command=self.destroy, width=100).pack(
-            pady=(0, 10)
-        )
-        self.after(80, self.lift)
+        self.bind("<Escape>", lambda _e: self.destroy())
 
 
 def _first_line(text: str) -> str:
@@ -754,7 +807,3 @@ def _first_line(text: str) -> str:
         if line.strip():
             return line.strip()
     return text.strip()
-
-
-def _in_thread(task: Callable[[], None]) -> None:
-    threading.Thread(target=task, daemon=True).start()

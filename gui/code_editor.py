@@ -4,25 +4,29 @@ Built on a raw :class:`tkinter.Text` rather than ``CTkTextbox`` because an edito
 needs the things the wrapper hides — tag configuration, the undo stack, and
 ``dlineinfo`` for gutter alignment.
 
-The colours are VS Code's Dark+ palette. That is a deliberate choice rather than
-a theme-matching one: anyone editing YAML has seen it, and familiarity is worth
-more here than blending into the surrounding window.
+Token colours are VS Code's Dark+ palette — anyone editing YAML has seen it, and
+familiarity is worth more than novelty — set on the application's own recessed
+background so the editor reads as part of the window rather than pasted into it.
 """
 
 import re
 import tkinter as tk
+import tkinter.font as tkfont
 from typing import Callable, Optional
 
 import customtkinter as ctk
 
+from gui import theme
+
 # ── Palette ──────────────────────────────────────────────────────────────────
-BG = "#1E1E1E"
+BG = theme.INSET
 FG = "#D4D4D4"
-GUTTER_BG = "#1E1E1E"
-GUTTER_FG = "#858585"
-GUTTER_ACTIVE_FG = "#C6C6C6"
+GUTTER_BG = theme.INSET
+GUTTER_FG = "#4B5263"
+GUTTER_ACTIVE_FG = "#C6CBD6"
 SELECT_BG = "#264F78"
-CURSOR = "#AEAFAD"
+CURSOR = "#C6CBD6"
+CURRENT_LINE_BG = "#12151B"
 
 SYNTAX_COLORS = {
     "key": "#9CDCFE",
@@ -37,7 +41,7 @@ SYNTAX_COLORS = {
 
 MATCH_BG = "#515C6A"
 CURRENT_MATCH_BG = "#9E6A03"
-ERROR_LINE_BG = "#4B1818"
+ERROR_LINE_BG = "#3A1619"
 
 INDENT = "  "
 """Two spaces. YAML forbids tabs for indentation, so the editor never inserts one."""
@@ -58,22 +62,24 @@ class CodeEditor(ctk.CTkFrame):
     """Editable YAML view with a line-number gutter and live highlighting."""
 
     def __init__(self, parent, on_change: Optional[Callable[[], None]] = None, **kwargs):
-        super().__init__(parent, fg_color=BG, corner_radius=6, **kwargs)
+        super().__init__(parent, fg_color=BG, corner_radius=10, border_width=1,
+                         border_color=theme.BORDER, **kwargs)
         self._on_change = on_change
         self._highlight_job: Optional[str] = None
         self._highlighted: Optional[str] = None
         """Buffer contents as of the last re-tag, so an unchanged one is skipped."""
 
         self._match_count = 0
-        self._current_match = 0
 
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
 
+        scale = theme.widget_scale(self)
         self._gutter = tk.Canvas(
-            self, width=52, bg=GUTTER_BG, highlightthickness=0, takefocus=0
+            self, width=round(56 * scale), bg=GUTTER_BG, highlightthickness=0, takefocus=0
         )
-        self._gutter.grid(row=0, column=0, sticky="ns")
+        # Same vertical offset as the text, so dlineinfo coordinates line up.
+        self._gutter.grid(row=0, column=0, sticky="ns", padx=(1, 0), pady=(1, 0))
 
         self.text = _ProxiedText(
             self,
@@ -81,34 +87,46 @@ class CodeEditor(ctk.CTkFrame):
             undo=True,
             maxundo=-1,
             autoseparators=True,
-            font=("Consolas", 12),
+            font=theme.scaled_mono(self, 14),
             bg=BG,
             fg=FG,
             insertbackground=CURSOR,
             selectbackground=SELECT_BG,
             selectforeground=FG,
             relief="flat",
-            padx=8,
-            pady=6,
+            borderwidth=0,
+            highlightthickness=0,
+            padx=12,
+            pady=8,
+            spacing1=2,
+            spacing3=2,
+            insertwidth=2,
             tabs="1c",
         )
-        self.text.grid(row=0, column=1, sticky="nsew")
+        self.text.grid(row=0, column=1, sticky="nsew", pady=(1, 0))
 
-        y_scroll = ctk.CTkScrollbar(self, command=self.text.yview)
-        y_scroll.grid(row=0, column=2, sticky="ns")
+        y_scroll = ctk.CTkScrollbar(self, command=self.text.yview, fg_color=BG)
+        y_scroll.grid(row=0, column=2, sticky="ns", padx=(0, 3), pady=6)
         x_scroll = ctk.CTkScrollbar(
-            self, orientation="horizontal", command=self.text.xview
+            self, orientation="horizontal", command=self.text.xview, fg_color=BG
         )
-        x_scroll.grid(row=1, column=1, sticky="ew")
+        x_scroll.grid(row=1, column=1, sticky="ew", pady=(0, 3))
         self.text.configure(
-            yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set
+            yscrollcommand=_autohiding(y_scroll), xscrollcommand=_autohiding(x_scroll)
         )
+        # Line numbers share the text's top edge; this aligns their tops too.
+        text_font = tkfont.Font(font=theme.scaled_mono(self, 14))
+        self._gutter_font = tkfont.Font(font=theme.scaled_mono(self, 12))
+        self._gutter_offset = 2 + text_font.metrics("ascent") - self._gutter_font.metrics("ascent")
 
         for name, color in SYNTAX_COLORS.items():
             self.text.tag_config(name, foreground=color)
         self.text.tag_config("match", background=MATCH_BG)
         self.text.tag_config("current_match", background=CURRENT_MATCH_BG)
         self.text.tag_config("error_line", background=ERROR_LINE_BG)
+        self.text.tag_config("current_line", background=CURRENT_LINE_BG)
+        # Lowest of all, so selection, matches and errors paint over it.
+        self.text.tag_lower("current_line")
         # Comments win over anything a regex found inside them.
         self.text.tag_raise("comment")
         self.text.tag_raise("match")
@@ -274,10 +292,15 @@ class CodeEditor(ctk.CTkFrame):
     # ── Highlighting ─────────────────────────────────────────────────────────
 
     def _on_text_change(self, _event=None) -> None:
+        self._mark_current_line()
         self._redraw_gutter()
         self._schedule_highlight()
         if self._on_change is not None:
             self._on_change()
+
+    def _mark_current_line(self) -> None:
+        self.text.tag_remove("current_line", "1.0", "end")
+        self.text.tag_add("current_line", "insert linestart", "insert lineend+1c")
 
     def _schedule_highlight(self) -> None:
         if self._highlight_job is not None:
@@ -361,11 +384,11 @@ class CodeEditor(ctk.CTkFrame):
             if info is None:
                 break  # Below the bottom of the viewport, or not yet mapped.
             self._gutter.create_text(
-                width - 8,
-                info[1],
+                width - 10,
+                info[1] + self._gutter_offset,
                 anchor="ne",
                 text=str(line_number),
-                font=("Consolas", 11),
+                font=self._gutter_font,
                 fill=GUTTER_ACTIVE_FG if line_number == cursor_line else GUTTER_FG,
             )
 
@@ -376,7 +399,6 @@ class CodeEditor(ctk.CTkFrame):
         self.text.tag_remove("match", "1.0", "end")
         self.text.tag_remove("current_match", "1.0", "end")
         self._match_count = 0
-        self._current_match = 0
         if not needle:
             return 0
 
@@ -467,6 +489,19 @@ class CodeEditor(ctk.CTkFrame):
     def clear_matches(self) -> None:
         self.text.tag_remove("match", "1.0", "end")
         self.text.tag_remove("current_match", "1.0", "end")
+
+
+def _autohiding(scrollbar: ctk.CTkScrollbar) -> Callable[[str, str], None]:
+    """A scroll command that hides ``scrollbar`` while everything is in view."""
+
+    def update(first: str, last: str) -> None:
+        scrollbar.set(first, last)
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            scrollbar.grid_remove()
+        else:
+            scrollbar.grid()
+
+    return update
 
 
 class _ProxiedText(tk.Text):

@@ -328,5 +328,23 @@ def _wrap(snippet: snippets.Snippet) -> str:
     )
 
 
+class TestIncludeInBulk(unittest.TestCase):
+    """The per-host switch for "Check for updates" and "Update all hosts"."""
+
+    def test_new_hosts_are_included(self):
+        self.assertTrue(Host("h", "u").include_in_bulk)
+
+    def test_the_choice_persists(self):
+        host = Host("h", "u", include_in_bulk=False)
+        self.assertFalse(Host.from_dict(host.to_dict()).include_in_bulk)
+
+    def test_files_from_before_the_option_include_every_host(self):
+        self.assertTrue(Host.from_dict({"hostname": "h", "username": "u"}).include_in_bulk)
+
+    def test_a_non_boolean_value_is_coerced(self):
+        host = Host.from_dict({"hostname": "h", "username": "u", "include_in_bulk": 0})
+        self.assertIs(host.include_in_bulk, False)
+
+
 if __name__ == "__main__":
     unittest.main()

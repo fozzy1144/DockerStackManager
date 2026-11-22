@@ -13,6 +13,8 @@ of a build that runs on the dev box and dies on someone else's:
 * keyring finds its backends through entry points, which PyInstaller's static
   analysis cannot see. The Windows backend is named explicitly, and
   ``win32timezone`` comes with it as an indirect pywin32 import.
+* ``gui/assets`` holds the window icon and logo, read from disk at runtime like
+  CustomTkinter's themes. The same .ico is the executable's own icon.
 """
 
 from PyInstaller.utils.hooks import collect_data_files
@@ -21,7 +23,7 @@ a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
-    datas=collect_data_files("customtkinter"),
+    datas=collect_data_files("customtkinter") + [("gui/assets", "gui/assets")],
     hiddenimports=[
         "keyring.backends.Windows",
         "win32timezone",
@@ -50,6 +52,7 @@ exe = EXE(
     upx=False,  # UPX-packed executables trip antivirus heuristics.
     runtime_tmpdir=None,
     console=False,  # A Tk app has no use for a console window.
+    icon="gui/assets/icon.ico",
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

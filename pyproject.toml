@@ -26,7 +26,7 @@ classifiers = [
 # broken us before, and a patch release should not need a commit here. Keep this
 # list and requirements.txt in step — the packaging test asserts they agree.
 dependencies = [
-  "customtkinter>=5.2.0,<6",
+  "customtkinter>=5.2.0,<7",  # Runs on both 5.2 and 6.0.
   "paramiko>=3.4.0,<5",
   "keyring>=25.0.0,<26",
   # Optional at runtime — core.compose degrades to the host-side validator
@@ -50,6 +50,10 @@ docker-stack-manager = "main:main"
 [tool.setuptools]
 packages = ["core", "gui", "models"]
 py-modules = ["main"]
+
+[tool.setuptools.package-data]
+# The window icon and sidebar logo; gui.theme loads them from beside itself.
+gui = ["assets/*.png", "assets/*.ico"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -7,7 +7,7 @@ hidden, so the dialog answers "is this machine already managed?" as well as
 """
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 import customtkinter as ctk
 import tkinter as tk
@@ -18,12 +18,12 @@ from core.ssh_config import (
     ACTION_SKIP,
     ImportCandidate,
 )
-from gui.theme import LEVEL_ACCENTS, MUTED, SELECTED
+from gui import theme
 
 _ACTION_LABELS = {
-    ACTION_ADD: ("add", LEVEL_ACCENTS["success"]),
-    ACTION_ATTACH_KEY: ("attach key", LEVEL_ACCENTS["info"]),
-    ACTION_SKIP: ("no change", MUTED),
+    ACTION_ADD: ("Add", theme.SUCCESS),
+    ACTION_ATTACH_KEY: ("Attach key", theme.INFO),
+    ACTION_SKIP: ("No change", theme.TEXT_3),
 }
 
 
@@ -46,19 +46,14 @@ class ImportHostsDialog(ctk.CTkToplevel):
         self._candidates = candidates
         self._checks: list[tuple[ImportCandidate, tk.BooleanVar]] = []
 
-        self.title("Import hosts from SSH config")
-        self.geometry("880x680")
-        self.minsize(700, 480)
+        self.title("Import hosts")
+        theme.present(self, parent, (860, 640), minsize=(700, 480))
+        self.transient(parent)
         self.grab_set()
 
         self._build(sources or [])
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         self.bind("<Escape>", lambda _event: self._cancel())
-        self.after(80, self._focus_window)
-
-    def _focus_window(self) -> None:
-        self.lift()
-        self.focus_force()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Layout
@@ -69,39 +64,38 @@ class ImportHostsDialog(ctk.CTkToplevel):
         self.grid_rowconfigure(2, weight=1)
 
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 2))
+        header.grid(row=0, column=0, sticky="ew", padx=24, pady=(22, 4))
 
         actionable = sum(1 for c in self._candidates if c.actionable)
-        ctk.CTkLabel(
-            header,
-            text=f"{len(self._candidates)} host(s) found, {actionable} to import",
-            font=ctk.CTkFont(size=15, weight="bold"),
-        ).pack(side="left")
+        theme.heading(header, "Import from SSH config", role="title").pack(side="left")
+        theme.pill(
+            header, f"{actionable} of {len(self._candidates)} to import",
+            theme.ACCENT_TEXT if actionable else theme.TEXT_3, base=theme.BG, dot=False,
+        ).pack(side="left", padx=(12, 0))
 
         if sources:
-            ctk.CTkLabel(
-                self,
-                text="Read from: " + ", ".join(str(path) for path in sources),
-                font=ctk.CTkFont(size=11),
-                text_color=MUTED,
-                anchor="w",
-            ).grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
+            theme.caption(
+                self, "Read from  " + ",  ".join(str(path) for path in sources), role="small",
+            ).grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 12))
 
-        self._rows = ctk.CTkScrollableFrame(self, label_text="")
-        self._rows.grid(row=2, column=0, sticky="nsew", padx=14)
+        panel = theme.card(self)
+        panel.grid(row=2, column=0, sticky="nsew", padx=24)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(0, weight=1)
+        self._rows = theme.scrollable(panel)
+        self._rows.grid(row=0, column=0, sticky="nsew", padx=(6, 2), pady=6)
         self._rows.grid_columnconfigure(0, weight=1)
 
         if self._candidates:
             for candidate in self._candidates:
                 self._add_row(candidate)
         else:
-            ctk.CTkLabel(
+            theme.caption(
                 self._rows,
-                text="No hosts found.\n\nVS Code Remote-SSH reads ~/.ssh/config; if "
-                     "your hosts live elsewhere, point remote.SSH.configFile at it.",
-                text_color=MUTED,
-                justify="left",
-            ).pack(pady=20)
+                "No hosts found.\n\nVS Code Remote-SSH reads ~/.ssh/config; if "
+                "your hosts live elsewhere, point remote.SSH.configFile at it.",
+                role="small",
+            ).pack(pady=20, padx=12, anchor="w")
 
         self._build_footer()
 
@@ -111,89 +105,69 @@ class ImportHostsDialog(ctk.CTkToplevel):
         selected = tk.BooleanVar(value=enabled)
         self._checks.append((candidate, selected))
 
-        row = ctk.CTkFrame(self._rows, corner_radius=6)
-        row.pack(fill="x", pady=2)
+        row = ctk.CTkFrame(
+            self._rows, corner_radius=10, border_width=1, border_color=theme.BORDER,
+            fg_color=theme.SURFACE_2 if enabled else theme.SURFACE,
+        )
+        row.pack(fill="x", pady=3, padx=(0, 4))
         row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkCheckBox(
             row,
             text="",
             variable=selected,
-            width=24,
+            width=20,
+            checkbox_width=18,
+            checkbox_height=18,
             state="normal" if enabled else "disabled",
-        ).grid(row=0, column=0, padx=(10, 4), pady=8)
+        ).grid(row=0, column=0, padx=(14, 6), pady=10)
 
         details = ctk.CTkFrame(row, fg_color="transparent")
-        details.grid(row=0, column=1, sticky="ew", padx=4)
-        details.grid_columnconfigure(0, weight=1)
+        details.grid(row=0, column=1, sticky="ew", padx=4, pady=10)
 
-        ctk.CTkLabel(
-            details,
-            text=host.alias,
-            font=ctk.CTkFont(weight="bold"),
-            text_color=None if enabled else MUTED,
-            anchor="w",
-        ).pack(fill="x")
-        ctk.CTkLabel(
-            details,
-            text=host.address,
-            font=ctk.CTkFont(size=11),
-            text_color=MUTED,
-            anchor="w",
-        ).pack(fill="x")
+        name = ctk.CTkFrame(details, fg_color="transparent")
+        name.pack(fill="x")
+        theme.text(name, host.alias, "body_strong",
+                   theme.TEXT if enabled else theme.TEXT_3).pack(side="left")
+        theme.text(name, host.address, "mono_small", theme.TEXT_3).pack(side="left", padx=(10, 0))
 
         detail_bits = [candidate.reason]
         if host.identity_file:
-            detail_bits.append(Path(host.identity_file).name)
+            detail_bits.append(f"key {Path(host.identity_file).name}")
         if host.proxy_jump:
             detail_bits.append(f"via {host.proxy_jump}")
-        ctk.CTkLabel(
-            details,
-            text="   ·   ".join(detail_bits),
-            font=ctk.CTkFont(size=11),
-            text_color="gray50",
-            anchor="w",
-        ).pack(fill="x")
+        theme.caption(details, "   ·   ".join(b for b in detail_bits if b)).pack(
+            fill="x", pady=(2, 0)
+        )
 
-        label, color = _ACTION_LABELS.get(candidate.action, ("?", MUTED))
-        ctk.CTkLabel(
-            row,
-            text=label,
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=color,
-            width=80,
-        ).grid(row=0, column=2, padx=10)
+        if enabled:
+            self.after_idle(lambda: theme.hover_row(row))
+        label, color = _ACTION_LABELS.get(candidate.action, ("?", theme.TEXT_3))
+        theme.pill(row, label, color, base=row.cget("fg_color"), width=104).grid(
+            row=0, column=2, padx=12
+        )
 
     def _build_footer(self) -> None:
         footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.grid(row=3, column=0, sticky="ew", padx=14, pady=12)
+        footer.grid(row=3, column=0, sticky="ew", padx=24, pady=(12, 22))
 
-        ctk.CTkButton(
-            footer, text="Select all", width=90, height=28,
-            command=lambda: self._select(True),
-        ).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(
-            footer, text="None", width=70, height=28,
-            command=lambda: self._select(False),
-        ).pack(side="left")
+        theme.button(footer, "Select all", lambda: self._select(True), variant="ghost",
+                     size="sm").pack(side="left")
+        theme.button(footer, "None", lambda: self._select(False), variant="ghost",
+                     size="sm").pack(side="left", padx=(2, 0))
 
-        ctk.CTkLabel(
+        theme.caption(
             footer,
-            text="Passwords are never read from the SSH config; key files are "
-                 "referenced, not copied.",
-            font=ctk.CTkFont(size=11),
-            text_color=MUTED,
+            "Passwords are never read from the SSH config; key files are referenced, "
+            "not copied.",
         ).pack(side="left", padx=14)
 
-        self._btn_import = ctk.CTkButton(
-            footer, text="Import", width=110, height=30,
-            fg_color=SELECTED, command=self._confirm,
-        )
+        self._btn_import = theme.button(footer, "Import", self._confirm, variant="primary",
+                                        width=110)
         self._btn_import.pack(side="right")
-        ctk.CTkButton(
-            footer, text="Cancel", width=90, height=30,
-            fg_color="gray40", command=self._cancel,
-        ).pack(side="right", padx=6)
+        theme.button(footer, "Cancel", self._cancel, variant="ghost").pack(
+            side="right", padx=(0, 8)
+        )
 
     # ──────────────────────────────────────────────────────────────────────────
     # Actions
@@ -227,6 +201,3 @@ def summarize(applied: list[ImportCandidate]) -> str:
     if keyed:
         parts.append(f"{keyed} key path(s) attached")
     return ", ".join(parts) if parts else "nothing to import"
-
-
-ApplyCallback = Callable[[ImportCandidate], None]

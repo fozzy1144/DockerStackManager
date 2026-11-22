@@ -9,45 +9,43 @@ actually terminates ``docker compose logs -f`` instead of leaving it attached to
 an abandoned channel.
 """
 
-import threading
 import tkinter as tk
-from tkinter import messagebox
 from typing import Callable, Optional
 
 import customtkinter as ctk
 
 from core.ssh_client import RemoteProcess, SSHClient
+from gui import dialogs, theme
 from gui.log_panel import LogPanel
-from gui.theme import (
-    ACCENT_PURPLE,
-    ACCENT_PURPLE_HOVER,
-    DANGER,
-    DANGER_HOVER,
-    MUTED,
-    SELECTED,
-    state_color,
-)
 from models.host import Container, DockerStack, ImageStatus
 
 TAIL_CHOICES = ("100", "500", "2000", "all")
 
-#: Lifecycle buttons: label, action name, whether it needs confirming, colours.
-_ACTIONS: tuple[tuple[str, str, bool, str, str], ...] = (
-    ("Up", "up", False, "", ""),
-    ("Restart", "restart", False, "", ""),
-    ("Stop", "stop", True, "", ""),
-    ("Pull", "pull", False, "", ""),
-    ("Recreate", "recreate", True, ACCENT_PURPLE, ACCENT_PURPLE_HOVER),
-    ("Down", "down", True, DANGER, DANGER_HOVER),
+#: Lifecycle buttons: label, action name, whether it needs confirming, and the
+#: button variant — the more disruptive the action, the louder the button.
+_ACTIONS: tuple[tuple[str, str, bool, str], ...] = (
+    ("Up", "up", False, "secondary"),
+    ("Restart", "restart", False, "secondary"),
+    ("Stop", "stop", True, "secondary"),
+    ("Pull", "pull", False, "secondary"),
+    ("Recreate", "recreate", True, "warning_soft"),
+    ("Down", "down", True, "danger_soft"),
 )
 
+#: Confirm-button verb and dialog tone per confirmed action.
+_CONFIRM_STYLE = {
+    "stop": ("Stop", "warning"),
+    "recreate": ("Recreate", "warning"),
+    "down": ("Take down", "danger"),
+}
+
 _CONFIRMATIONS = {
-    "stop": "Stop every container in '{name}'?\n\nThe stack stays defined and can "
-            "be started again.",
-    "down": "Take '{name}' down?\n\nContainers and the stack's network are removed. "
-            "Named volumes are kept.",
-    "recreate": "Recreate every container in '{name}'?\n\nContainers are destroyed "
-                "and rebuilt from the compose file, even if nothing changed.",
+    "stop": "Every container in {name} stops. The stack stays defined and can be "
+            "started again with Up.",
+    "down": "The containers and network of {name} are removed. Named volumes are kept, "
+            "so Up brings it back with its data.",
+    "recreate": "Every container in {name} is destroyed and rebuilt from the compose "
+                "file, even if nothing changed.",
 }
 
 
@@ -69,24 +67,18 @@ class StackWindow(ctk.CTkToplevel):
         self._on_edit = on_edit
 
         self._process: Optional[RemoteProcess] = None
-        self._containers: list[Container] = []
         self._busy = False
         self._service_filter = tk.StringVar(value="(all services)")
         self._tail = tk.StringVar(value="500")
         self._follow = tk.BooleanVar(value=True)
 
-        self.title(f"Stack — {stack.name}")
-        self.geometry("1120x780")
-        self.minsize(880, 600)
+        self.title(f"{stack.name} — Stack")
+        theme.present(self, parent, (1180, 820), minsize=(920, 640))
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
-        self.after(80, self._focus_window)
+        self.bind("<F5>", lambda _e: self.refresh())
         self.after(120, self.refresh)
-
-    def _focus_window(self) -> None:
-        self.lift()
-        self.focus_force()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Layout
@@ -94,110 +86,105 @@ class StackWindow(ctk.CTkToplevel):
 
     def _build(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
-        self.grid_rowconfigure(4, weight=2)
+        self.grid_rowconfigure(2, weight=2)
+        self.grid_rowconfigure(3, weight=3)
 
         self._build_header()
         self._build_actions()
 
-        self._container_list = ctk.CTkScrollableFrame(self, label_text="")
-        self._container_list.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 4))
+        containers = theme.card(self)
+        containers.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 10))
+        containers.grid_columnconfigure(0, weight=1)
+        containers.grid_rowconfigure(1, weight=1)
+        head = ctk.CTkFrame(containers, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 6))
+        theme.heading(head, "Containers", role="heading").pack(side="left")
+        self._count = theme.caption(head, "", role="small")
+        self._count.pack(side="left", padx=(8, 0))
+
+        self._container_list = theme.scrollable(containers)
+        self._container_list.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=(0, 8))
         self._container_list.grid_columnconfigure(0, weight=1)
 
-        self._build_log_controls()
-
-        self._log = LogPanel(self)
-        self._log.grid(row=4, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self._log = LogPanel(self, title="Logs", filters=False)
+        self._log.grid(row=3, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        self._build_log_controls(self._log.toolbar)
 
     def _build_header(self) -> None:
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 2))
+        header.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 4))
+        header.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
-            header, text=self._stack.name, font=ctk.CTkFont(size=17, weight="bold")
-        ).pack(side="left")
-        ctk.CTkLabel(
-            header, text=self._stack.path, font=ctk.CTkFont(size=11), text_color=MUTED
-        ).pack(side="left", padx=10)
+        theme.overline(header, "Stack").grid(row=0, column=0, sticky="w")
+        theme.heading(header, self._stack.name, role="display").grid(row=1, column=0, sticky="w")
+        theme.text(header, self._stack.path, "mono_small", theme.TEXT_3).grid(
+            row=2, column=0, sticky="w", pady=(2, 0)
+        )
 
-        self._summary = ctk.CTkLabel(header, text="", font=ctk.CTkFont(size=12))
-        self._summary.pack(side="right")
+        self._summary = theme.pill(header, "", theme.TEXT_3, base=theme.BG)
+        self._summary.grid(row=1, column=1, sticky="e")
 
     def _build_actions(self) -> None:
         row = ctk.CTkFrame(self, fg_color="transparent")
-        row.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 6))
+        row.grid(row=1, column=0, sticky="ew", padx=20, pady=(12, 14))
 
         self._buttons: list[ctk.CTkButton] = []
-        for label, action, confirm, color, hover in _ACTIONS:
-            extra = {}
-            if color:
-                extra = {"fg_color": color, "hover_color": hover}
-            button = ctk.CTkButton(
-                row,
-                text=label,
-                width=88,
-                height=28,
-                command=lambda a=action, c=confirm: self._run_action(a, c),
-                **extra,
-            )
-            button.pack(side="left", padx=3)
-            self._buttons.append(button)
 
-        self._btn_images = ctk.CTkButton(
-            row, text="Check images", width=112, height=28, command=self._check_images
-        )
-        self._btn_images.pack(side="left", padx=(14, 3))
-        self._buttons.append(self._btn_images)
+        def add(widget: ctk.CTkButton, gap: int = 6, tip: str = "") -> ctk.CTkButton:
+            widget.pack(side="left", padx=(0, gap))
+            self._buttons.append(widget)
+            if tip:
+                theme.Tooltip(widget, tip)
+            return widget
 
-        self._btn_rollback = ctk.CTkButton(
-            row, text="Roll back", width=88, height=28,
-            fg_color=DANGER, hover_color=DANGER_HOVER, command=self._roll_back,
-        )
-        self._btn_rollback.pack(side="left", padx=3)
-        self._buttons.append(self._btn_rollback)
+        for label, action, confirm, variant in _ACTIONS:
+            add(theme.button(
+                row, label, lambda a=action, c=confirm: self._run_action(a, c),
+                variant=variant, size="sm",
+            ))
 
-        self._btn_edit = ctk.CTkButton(
-            row, text="Edit compose", width=112, height=28, command=self._edit
+        theme.divider(row, vertical=True, color=theme.BORDER_STRONG).pack(
+            side="left", padx=(6, 12), fill="y", pady=4
         )
-        self._btn_edit.pack(side="left", padx=3)
-        self._buttons.append(self._btn_edit)
 
-        self._btn_refresh = ctk.CTkButton(
-            row, text="Refresh", width=82, height=28, command=self.refresh
-        )
-        self._btn_refresh.pack(side="right", padx=3)
+        add(theme.button(row, "Check images", self._check_images, size="sm"),
+            tip="Ask each registry whether a newer image exists")
+        add(theme.button(row, "Roll back", self._roll_back, variant="danger_soft", size="sm"),
+            tip="Restore the image versions from before the last update")
+        add(theme.button(row, "Edit compose", self._edit, size="sm"))
+
+        self._btn_refresh = theme.button(row, "Refresh", self.refresh, variant="ghost", size="sm")
+        self._btn_refresh.pack(side="right")
         self._buttons.append(self._btn_refresh)
+        theme.Tooltip(self._btn_refresh, "Re-read containers  (F5)")
 
-    def _build_log_controls(self) -> None:
-        row = ctk.CTkFrame(self, fg_color="transparent")
-        row.grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 2))
-
-        ctk.CTkLabel(row, text="Logs", font=ctk.CTkFont(weight="bold")).pack(side="left")
-
+    def _build_log_controls(self, row) -> None:
         self._service_menu = ctk.CTkOptionMenu(
-            row, values=["(all services)"], variable=self._service_filter, width=180
+            row, values=["(all services)"], variable=self._service_filter, width=170,
+            height=28, font=theme.font("small"), dropdown_font=theme.font("small"),
         )
-        self._service_menu.pack(side="left", padx=(12, 4))
+        self._service_menu.pack(side="left")
 
-        ctk.CTkLabel(row, text="tail", font=ctk.CTkFont(size=11)).pack(side="left")
+        theme.caption(row, "tail", role="small").pack(side="left", padx=(12, 6))
         ctk.CTkOptionMenu(
-            row, values=list(TAIL_CHOICES), variable=self._tail, width=90
-        ).pack(side="left", padx=4)
+            row, values=list(TAIL_CHOICES), variable=self._tail, width=78, height=28,
+            font=theme.font("small"), dropdown_font=theme.font("small"),
+        ).pack(side="left")
 
-        ctk.CTkCheckBox(row, text="follow", variable=self._follow, width=80).pack(
-            side="left", padx=6
-        )
+        ctk.CTkSwitch(
+            row, text="Follow", variable=self._follow, font=theme.font("small"),
+            switch_width=32, switch_height=16, width=80,
+        ).pack(side="left", padx=(14, 0))
 
-        self._btn_stop = ctk.CTkButton(
-            row, text="Stop", width=74, height=26, command=self._stop_logs,
-            state="disabled", fg_color=DANGER, hover_color=DANGER_HOVER,
+        self._btn_stop = theme.button(
+            row, "Stop", self._stop_logs, variant="danger_soft", size="sm", state="disabled",
         )
-        self._btn_stop.pack(side="right", padx=3)
+        self._btn_stop.pack(side="right", padx=(4, 4))
 
-        self._btn_show = ctk.CTkButton(
-            row, text="Show logs", width=98, height=26, command=self._start_logs
+        self._btn_show = theme.button(
+            row, "Show logs", self._start_logs, variant="primary", size="sm",
         )
-        self._btn_show.pack(side="right", padx=3)
+        self._btn_show.pack(side="right")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Containers
@@ -208,40 +195,40 @@ class StackWindow(ctk.CTkToplevel):
         if self._busy:
             return
         self._set_busy(True)
-        self._summary.configure(text="reading…", text_color=MUTED)
+        theme.set_pill(self._summary, "Reading…", theme.TEXT_3, base=theme.BG)
 
         def task() -> None:
             containers = self._ssh.compose_ps(self._stack)
             self.after(0, lambda: self._show_containers(containers))
 
-        _in_thread(task)
+        theme.run_in_thread(task)
 
     def _show_containers(self, containers: list[Container]) -> None:
         self._set_busy(False)
-        self._containers = containers
 
         for widget in self._container_list.winfo_children():
             widget.destroy()
 
         if not containers:
-            ctk.CTkLabel(
+            theme.caption(
                 self._container_list,
-                text="No containers. The stack is defined but has never been "
-                     "started, or Docker is unreachable.",
-                text_color=MUTED,
-                anchor="w",
-                justify="left",
-            ).pack(fill="x", padx=6, pady=10)
-            self._summary.configure(text="0 containers", text_color=MUTED)
+                "No containers. The stack is defined but has never been started, "
+                "or Docker is unreachable.",
+                role="small",
+            ).pack(fill="x", padx=8, pady=14)
+            theme.set_pill(self._summary, "No containers", theme.TEXT_3, base=theme.BG)
+            self._count.configure(text="")
         else:
             for container in containers:
                 self._add_container_row(container)
             running = sum(1 for c in containers if c.is_running)
             total = len(containers)
-            self._summary.configure(
-                text=f"{running}/{total} running",
-                text_color=state_color("running" if running == total else "partial"),
+            state = "running" if running == total else "stopped" if not running else "partial"
+            theme.set_pill(
+                self._summary, f"{running} of {total} running", theme.state_color(state),
+                base=theme.BG,
             )
+            self._count.configure(text=str(total))
 
         services = ["(all services)"] + sorted(
             {c.service for c in containers if c.service}
@@ -251,54 +238,41 @@ class StackWindow(ctk.CTkToplevel):
             self._service_filter.set("(all services)")
 
     def _add_container_row(self, container: Container) -> None:
-        row = ctk.CTkFrame(self._container_list, corner_radius=6)
-        row.pack(fill="x", pady=2)
+        row = ctk.CTkFrame(
+            self._container_list, corner_radius=10, fg_color=theme.SURFACE_2,
+            border_width=1, border_color=theme.BORDER,
+        )
+        row.pack(fill="x", pady=3, padx=(0, 4))
         row.grid_columnconfigure(1, weight=1)
+        self.after_idle(lambda: theme.hover_row(row))
 
-        ctk.CTkLabel(
-            row,
-            text=container.status_label,
-            text_color=state_color(container.health or container.state),
-            font=ctk.CTkFont(size=11, weight="bold"),
-            width=130,
-            anchor="w",
-        ).grid(row=0, column=0, padx=(10, 4), pady=6, sticky="w")
+        theme.pill(
+            row, container.status_label,
+            theme.state_color(container.health or container.state),
+            width=150, anchor="w",
+        ).grid(row=0, column=0, padx=(12, 6), pady=12, sticky="w")
 
         details = ctk.CTkFrame(row, fg_color="transparent")
-        details.grid(row=0, column=1, sticky="ew", padx=4)
-        details.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            details,
-            text=container.service or container.name,
-            font=ctk.CTkFont(weight="bold"),
-            anchor="w",
-        ).pack(fill="x")
+        details.grid(row=0, column=1, sticky="ew", padx=6, pady=8)
+        theme.text(details, container.service or container.name, "body_strong").pack(fill="x")
         subtitle = container.name
         if container.image:
-            subtitle += f"   ·   {container.image}"
-        ctk.CTkLabel(
-            details, text=subtitle, font=ctk.CTkFont(size=11),
-            text_color=MUTED, anchor="w",
-        ).pack(fill="x")
+            subtitle += f"  ·  {container.image}"
+        theme.text(details, subtitle, "mono_small", theme.TEXT_3).pack(fill="x", pady=(1, 0))
 
-        ctk.CTkLabel(
+        theme.text(
             row,
-            text=container.ports or "no published ports",
-            font=ctk.CTkFont(size=11),
-            text_color=MUTED if container.ports else "gray45",
+            container.ports or "no published ports",
+            "mono_small",
+            theme.TEXT_2 if container.ports else theme.TEXT_DISABLED,
             anchor="e",
-        ).grid(row=0, column=2, padx=8)
+        ).grid(row=0, column=2, padx=10)
 
         if container.service:
-            ctk.CTkButton(
-                row,
-                text="logs",
-                width=54,
-                height=24,
-                fg_color=SELECTED,
-                command=lambda s=container.service: self._logs_for(s),
-            ).grid(row=0, column=3, padx=(4, 10))
+            theme.button(
+                row, "Logs", lambda s=container.service: self._logs_for(s),
+                variant="ghost", size="sm",
+            ).grid(row=0, column=3, padx=(0, 10))
 
     def _logs_for(self, service: str) -> None:
         """Filter to one service and start streaming immediately."""
@@ -313,10 +287,11 @@ class StackWindow(ctk.CTkToplevel):
         if self._busy:
             return
         prompt = _CONFIRMATIONS.get(action)
-        if confirm and prompt and not messagebox.askyesno(
-            f"Confirm {action}",
+        verb, tone = _CONFIRM_STYLE.get(action, (action.capitalize(), "warning"))
+        if confirm and prompt and not dialogs.askyesno(
+            f"{verb} {self._stack.name}?",
             prompt.format(name=self._stack.name),
-            parent=self,
+            parent=self, confirm=verb, tone=tone,
         ):
             return
 
@@ -327,13 +302,18 @@ class StackWindow(ctk.CTkToplevel):
             ok = self._ssh.compose_action(self._stack, action, self._log.log)
             self.after(0, lambda: self._after_action(action, ok))
 
-        _in_thread(task)
+        theme.run_in_thread(task)
 
     def _after_action(self, action: str, ok: bool) -> None:
         self._set_busy(False)
         self._log.log(
             f"'{action}' {'finished' if ok else 'failed'}.",
             "success" if ok else "error",
+        )
+        dialogs.toast(
+            self, f"{action.capitalize()} {'finished' if ok else 'failed'}",
+            "success" if ok else "error",
+            detail="" if ok else "See the log below for the output.",
         )
         if self._on_changed is not None:
             self._on_changed()
@@ -358,7 +338,7 @@ class StackWindow(ctk.CTkToplevel):
             statuses = self._ssh.check_stack_images(self._stack)
             self.after(0, lambda: self._show_image_statuses(statuses))
 
-        _in_thread(task)
+        theme.run_in_thread(task)
 
     def _show_image_statuses(self, statuses: list[ImageStatus]) -> None:
         self._set_busy(False)
@@ -387,6 +367,13 @@ class StackWindow(ctk.CTkToplevel):
         if unknown:
             summary += f", {unknown} could not be determined"
         self._log.log(summary, "warn" if outdated else "success")
+        dialogs.toast(
+            self,
+            f"{outdated} image update{'' if outdated == 1 else 's'} available" if outdated
+            else "Images are up to date",
+            "warning" if outdated else "success",
+            detail=f"{unknown} could not be determined" if unknown else "",
+        )
 
     def _roll_back(self) -> None:
         """Restore the image versions recorded before the last pull."""
@@ -394,7 +381,7 @@ class StackWindow(ctk.CTkToplevel):
             return
         snapshot = dict(self._stack.image_snapshot)
         if not snapshot:
-            messagebox.showinfo(
+            dialogs.showinfo(
                 "Nothing to roll back to",
                 "No previous image versions have been recorded for this stack.\n\n"
                 "A rollback point is created automatically the next time the stack "
@@ -405,11 +392,11 @@ class StackWindow(ctk.CTkToplevel):
 
         taken = self._stack.snapshot_taken or "an earlier update"
         listing = "\n".join(f"  • {image}" for image in sorted(snapshot))
-        if not messagebox.askyesno(
-            "Roll back images",
-            f"Restore the image versions recorded at {taken}?\n\n{listing}\n\n"
-            f"Containers will be recreated from those images.",
-            parent=self,
+        if not dialogs.askyesno(
+            "Roll back images?",
+            f"The image versions recorded at {taken} will be restored and the "
+            f"containers recreated from them.\n\n{listing}",
+            parent=self, confirm="Roll back", tone="warning",
         ):
             return
 
@@ -419,7 +406,7 @@ class StackWindow(ctk.CTkToplevel):
             ok = self._ssh.rollback_stack(self._stack, snapshot, self._log.log)
             self.after(0, lambda: self._after_rollback(ok))
 
-        _in_thread(task)
+        theme.run_in_thread(task)
 
     def _after_rollback(self, ok: bool) -> None:
         self._set_busy(False)
@@ -427,6 +414,8 @@ class StackWindow(ctk.CTkToplevel):
             "Rollback complete." if ok else "Rollback did not complete.",
             "success" if ok else "error",
         )
+        dialogs.toast(self, "Rolled back" if ok else "Rollback failed",
+                      "success" if ok else "error")
         if ok and self._on_changed is not None:
             self._on_changed()
         self.refresh()
@@ -461,7 +450,7 @@ class StackWindow(ctk.CTkToplevel):
             process.pump(self._log.log, timeout=_LOG_TIMEOUT)
             self.after(0, lambda: self._logs_finished(""))
 
-        _in_thread(task)
+        theme.run_in_thread(task)
 
     def _stop_logs(self) -> None:
         process, self._process = self._process, None
@@ -494,7 +483,3 @@ class StackWindow(ctk.CTkToplevel):
 
 
 _LOG_TIMEOUT = 86400
-
-
-def _in_thread(task: Callable[[], None]) -> None:
-    threading.Thread(target=task, daemon=True).start()

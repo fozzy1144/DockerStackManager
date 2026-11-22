@@ -18,7 +18,8 @@ jobs:
   test:
     # Windows is the platform the app targets and the only one with the
     # credential-manager backend the keyring code expects, so it is what CI
-    # runs. The test suite itself never opens a Tk root or a socket.
+    # runs. The suite never opens a socket; the one module that opens a window
+    # (the canvas-drawn host list) parks it off-screen and skips without a display.
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -48,7 +49,7 @@ jobs:
           python -m pytest -q
           --cov=core --cov=gui --cov=models
           --cov-report=term-missing:skip-covered
-          --cov-fail-under=43
+          --cov-fail-under=45
 
       # PyYAML is optional at runtime: without it core.compose skips the
       # structural lint rules and leans on the host's `docker compose config`.
@@ -77,11 +78,11 @@ jobs:
           pip install -r requirements.txt
 
       - name: Byte-compile every module
-        run: python -m compileall -q core gui models tools main.py
+        run: python -m compileall -q core gui models tools main.py run.pyw
 
       - name: Import the GUI modules
         run: |
-          python -c "import gui.app, gui.compose_editor, gui.stack_window, gui.maintenance, gui.import_dialog, gui.host_dialog, gui.host_list, gui.log_panel, gui.code_editor, gui.theme"
+          python -c "import gui.app, gui.compose_editor, gui.stack_window, gui.maintenance, gui.import_dialog, gui.host_dialog, gui.host_list, gui.log_panel, gui.code_editor, gui.theme, gui.dialogs, gui.palette, gui.settings"
 
   build:
     # The spec file's hidden imports and collected data cannot be checked by

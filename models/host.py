@@ -166,6 +166,13 @@ class Host:
     os_like: str = ""
     """``ID_LIKE`` parents, used to pick a package manager for derivatives."""
 
+    include_in_bulk: bool = True
+    """Whether "Check for updates" and "Update all hosts" touch this host.
+
+    Persisted. Files written before the option existed load with it on, which
+    is how bulk actions behaved then.
+    """
+
     stacks: list[DockerStack] = field(default_factory=list)
 
     pending_updates: int = UPDATES_UNKNOWN
@@ -199,6 +206,7 @@ class Host:
         entries rather than let one bad record stop the app from starting.
         """
         host = _build(cls, data)
+        host.include_in_bulk = bool(host.include_in_bulk)
         host.stacks = _load_stacks(data.get("stacks"))
         return host
 

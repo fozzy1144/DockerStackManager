@@ -11,6 +11,7 @@ import ast
 import re
 import tomllib
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -131,6 +132,57 @@ class TestPyInstallerSpec(unittest.TestCase):
 
     def test_entry_script_exists(self):
         self.assertTrue((ROOT / "main.py").is_file())
+
+    def test_bundles_the_gui_assets(self):
+        # gui.theme loads the icon and logo from disk; a build without them
+        # falls back to Tk's default icon and a sidebar with no logo.
+        self.assertIn('("gui/assets", "gui/assets")', self.source)
+        self.assertIn('icon="gui/assets/icon.ico"', self.source)
+
+
+class TestWindowsLaunchers(unittest.TestCase):
+    """Starting from source should not leave a console window behind the app."""
+
+    def test_batch_file_starts_without_a_console(self):
+        source = (ROOT / "run.bat").read_text(encoding="utf-8")
+        self.assertIn('start "" pythonw main.py', source)
+
+    def test_batch_file_still_works_without_pythonw(self):
+        source = (ROOT / "run.bat").read_text(encoding="utf-8")
+        self.assertIn("python main.py", source.split(":console", 1)[1])
+
+    def test_double_click_launcher_runs_the_entry_point(self):
+        source = (ROOT / "run.pyw").read_text(encoding="utf-8")
+        self.assertIn("from main import main", source)
+
+    def test_a_failed_start_is_reported_without_a_console(self):
+        # Under pythonw stderr is None; the message must go to a dialog instead
+        # of being lost (or raising while trying to print it).
+        import main
+
+        shown = []
+        with mock.patch.object(main.sys, "stderr", None), \
+                mock.patch("ctypes.windll", create=True) as windll:
+            windll.user32.MessageBoxW.side_effect = lambda *args: shown.append(args[1])
+            main.report_failure("Missing dependency: paramiko")
+        self.assertEqual(shown, ["Missing dependency: paramiko"])
+
+
+class TestAssets(unittest.TestCase):
+    """The files ``gui.theme`` and ``gui.app`` load at runtime."""
+
+    ASSETS = ROOT / "gui" / "assets"
+
+    def test_runtime_assets_exist(self):
+        for name in ("icon.ico", "icon.png", "logo-30.png", "logo-45.png", "logo-60.png"):
+            with self.subTest(name):
+                self.assertTrue((self.ASSETS / name).is_file())
+
+    def test_assets_ship_in_the_wheel(self):
+        with PYPROJECT.open("rb") as handle:
+            package_data = tomllib.load(handle)["tool"]["setuptools"]["package-data"]
+        self.assertIn("assets/*.png", package_data["gui"])
+        self.assertIn("assets/*.ico", package_data["gui"])
 
 
 if __name__ == "__main__":

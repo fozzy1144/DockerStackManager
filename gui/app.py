@@ -229,8 +229,14 @@ class App(ctk.CTk):
         bar.grid(row=0, column=0, sticky="ew", padx=24, pady=(22, 12))
         bar.grid_columnconfigure(0, weight=1)
 
+        # Fills its cell, so its width is the room left beside the buttons —
+        # which is what the header's text is cut to fit (see _fit_header).
         identity = ctk.CTkFrame(bar, fg_color="transparent")
-        identity.grid(row=0, column=0, sticky="w")
+        identity.grid(row=0, column=0, sticky="ew")
+        self._identity = identity
+        self._header_full = {"title": "No host selected", "os": "", "meta": ""}
+        self._header_fit_job: Optional[str] = None
+        identity.bind("<Configure>", lambda _event: self._fit_header_soon())
 
         title_row = ctk.CTkFrame(identity, fg_color="transparent")
         title_row.pack(anchor="w")
@@ -416,9 +422,8 @@ class App(ctk.CTk):
 
     def _show_no_host(self) -> None:
         """Header and stack panel for when nothing is selected."""
-        self._host_title.configure(text="No host selected")
         self._os_chip.pack_forget()
-        self._host_meta.configure(text="")
+        self._set_header(title="No host selected", os="", meta="")
         theme.set_pill(self._conn_pill, "", theme.TEXT_3, base=theme.BG)
         self._conn_pill.pack_forget()
         self._btn_connect.configure(state="disabled")
@@ -452,6 +457,60 @@ class App(ctk.CTk):
             for label, command, variant in actions:
                 theme.button(row, label, command, variant=variant).pack(side="left", padx=4)
 
+    def _set_header(self, **texts: str) -> None:
+        """Set the header's ``title``, ``os`` or ``meta`` text, cut to fit."""
+        self._header_full.update(texts)
+        self._fit_header()
+
+    def _fit_header_soon(self) -> None:
+        """Refit once the layout has settled; bursts of changes cost one pass."""
+        if self._header_fit_job is None:
+            self._header_fit_job = self.after_idle(self._fit_header)
+
+    def _fit_header(self) -> None:
+        """Cut the header's text to the room beside the action buttons.
+
+        A label given less room than its text needs loses the end of it at the
+        edge, mid-letter. The buttons keep their size, so at narrow widths the
+        text gives way instead, each piece ending in an ellipsis: the caption
+        yields to the connection pill and the activity note, and the title and
+        the OS chip share their row.
+        """
+        self._header_fit_job = None
+        full = self._header_full
+        room = self._identity.winfo_width()
+        if room <= 1:  # Not laid out yet; <Configure> comes back with a size.
+            self._host_title.configure(text=full["title"])
+            self._os_badge.configure(text=full["os"])
+            self._host_meta.configure(text=full["meta"])
+            return
+        scale = theme.widget_scale(self)
+        measure_title = theme.tk_font(self, "display").measure
+        measure_small = theme.tk_font(self, "small").measure
+
+        # Title row: the name keeps at least half; the OS chip takes what is left.
+        title, os_text = full["title"], full["os"]
+        if self._os_chip.winfo_manager():
+            chip_frame = round(49 * scale)  # Gap, dot and the chip's own padding.
+            chip = chip_frame + measure_small(os_text)
+            title = theme.fit_text(title, max(room - chip, room // 2), measure_title)
+            os_text = theme.fit_text(
+                os_text, room - measure_title(title) - chip_frame, measure_small)
+        else:
+            title = theme.fit_text(title, room, measure_title)
+        self._host_title.configure(text=title)
+        self._os_badge.configure(text=os_text)
+
+        # Caption row: whatever the pill and the activity note leave over.
+        self.update_idletasks()
+        taken = round(12 * scale)
+        if self._conn_pill.winfo_manager():
+            taken += self._conn_pill.winfo_reqwidth()
+        if self._activity.winfo_manager():
+            taken += self._activity.winfo_reqwidth() + round(16 * scale)
+        self._host_meta.configure(
+            text=theme.fit_text(full["meta"], max(room - taken, 0), measure_small))
+
     def _update_connection_display(self) -> None:
         """Connection pill and host caption, from the current state."""
         host = self._active
@@ -471,7 +530,7 @@ class App(ctk.CTk):
             bits.append("key auth")
         if host.pending_updates > 0:
             bits.append(f"{host.pending_updates} OS update{'s' if host.pending_updates != 1 else ''} pending")
-        self._host_meta.configure(text="   ·   ".join(bits))
+        self._set_header(meta="   ·   ".join(bits))
         self._host_list.set_connected(host if self._connected() else None)
 
     def _set_connect_button(self, mode: str) -> None:
@@ -671,8 +730,8 @@ class App(ctk.CTk):
             self._connect()
 
     def _show_host(self, host: Host) -> None:
-        self._host_title.configure(text=host.display_name)
-        self._os_badge.configure(text=host.os_pretty or "OS not detected yet")
+        self._set_header(title=host.display_name,
+                         os=host.os_pretty or "OS not detected yet")
         self._os_dot.configure(
             text_color=theme.lighten(os_badge_color(host), 0.25)
             if host.os_pretty else theme.TEXT_3
@@ -1382,6 +1441,7 @@ class App(ctk.CTk):
         else:
             self._spinner.stop()
             self._activity.pack_forget()
+        self._fit_header_soon()  # The caption shares its row with this.
 
     def _show_progress(self, active: bool) -> None:
         """Run or park the hairline progress bar under the header."""
